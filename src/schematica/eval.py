@@ -120,8 +120,12 @@ def evaluate_metric(engine, metric: dict) -> MetricResult:
     result.null_rate  = df["_value"].isna().mean()
     result.value_min  = float(df["_value"].min()) if not df["_value"].isna().all() else None
     result.value_max  = float(df["_value"].max()) if not df["_value"].isna().all() else None
-    result.actual_start = str(df["_date"].iloc[0])[:10]
-    result.actual_end   = str(df["_date"].iloc[-1])[:10]
+    # Guard against all-NULL date columns: str(None) produces "None", which
+    # would corrupt the date range comparison downstream.
+    _start_raw = df["_date"].iloc[0]
+    _end_raw   = df["_date"].iloc[-1]
+    result.actual_start = str(_start_raw)[:10] if _start_raw is not None else ""
+    result.actual_end   = str(_end_raw)[:10]   if _end_raw   is not None else ""
 
     # Date column parseability: col 0 should be interpretable as dates.
     # Small integers that pass pd.to_datetime (e.g. Unix timestamps near epoch)

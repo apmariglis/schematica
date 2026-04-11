@@ -388,3 +388,29 @@ def test_evaluate_fact_warns_for_zero_rows(engine):
 
     assert result.status == "WARN"
     assert "zero_rows" in result.error
+
+
+# ── evaluate_metric — null date column ────────────────────────────────────────
+
+def test_evaluate_metric_does_not_store_the_string_none_when_date_column_is_null():
+    # A query that returns NULL in the date column must not record "None" as the
+    # actual_start/end — that string would corrupt the date range comparison.
+    eng = create_engine("sqlite:///:memory:")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (dt TEXT, val REAL)"))
+        conn.execute(text("""
+            INSERT INTO t VALUES
+                (NULL, 1.0),
+                (NULL, 2.0),
+                (NULL, 3.0)
+        """))
+    metric = {
+        "name": "null_dates", "confidence": "high", "granularity": "daily",
+        "unit": "units", "time_range": {},
+        "sql": "SELECT dt, val FROM t",
+    }
+
+    result = evaluate_metric(eng, metric)
+
+    assert result.actual_start != "None"
+    assert result.actual_end   != "None"
