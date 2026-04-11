@@ -152,9 +152,6 @@ class _LiteLLMBackend:
         }
 
     def _choice(self, response):
-        if not response.choices:
-            raise ValueError(f"LiteLLM returned empty choices (model={self._model}). "
-                             "This usually means the response was filtered or the provider returned an error.")
         return response.choices[0]
 
     def stop_reason(self, response) -> str:
