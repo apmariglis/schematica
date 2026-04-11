@@ -143,6 +143,17 @@ def test_tables_referenced_returns_empty_set_for_no_from_clause():
     assert result == set()
 
 
+def test_tables_referenced_does_not_crash_on_subquery_expression():
+    # FROM (...) produces a match where all four capture groups are empty;
+    # the function must not raise StopIteration / RuntimeError.
+    fn = _get_tables_referenced()
+
+    result = fn("SELECT * FROM (SELECT x FROM readings) AS sub")
+
+    # The inner table is captured; the subquery itself is not treated as a name
+    assert "readings" in result
+
+
 # ── _tables_used_violations (agent.py) ────────────────────────────────────────
 
 def _get_tables_used_violations():

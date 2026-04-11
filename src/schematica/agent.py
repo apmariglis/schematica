@@ -102,9 +102,15 @@ def _tables_referenced_in_sql(sql: str) -> set[str]:
     """
     # Each alternative captures the table name into a different group;
     # filter out empty strings and normalise to lowercase.
+    # next() uses None as default so subquery expressions (e.g. FROM (...) AS sub)
+    # that produce all-empty groups don't raise StopIteration / RuntimeError.
     pattern = r'\b(?:FROM|JOIN)\s+(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|(\w+))'
     matches = re.findall(pattern, sql, re.IGNORECASE)
-    return {next(g for g in groups if g).lower() for groups in matches}
+    return {
+        name.lower()
+        for groups in matches
+        if (name := next((g for g in groups if g), None)) is not None
+    }
 
 
 def _tables_used_violations(items: list[dict]) -> list[str]:
