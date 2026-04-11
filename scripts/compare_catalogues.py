@@ -77,13 +77,18 @@ _CATALOGUE_INDEX_RE = re.compile(r"_catalogue(?:_(\d+))?\.json$")
 def _collect_catalogue_paths(sources: list[str]) -> list[Path]:
     """
     Expand a mixed list of directories and explicit JSON file paths into a flat
-    list of catalogue JSON paths. Directories are scanned one level deep for
-    *_catalogue*.json files in their immediate subfolders.
+    list of catalogue JSON paths.
+
+    For directories: catalogues found directly inside the directory AND inside
+    any immediate subfolders are included (two levels total).
     """
     paths: list[Path] = []
     for src in sources:
         p = Path(src)
         if p.is_dir():
+            # Files directly in the directory
+            paths.extend(sorted(p.glob("*_catalogue*.json")))
+            # Files one level deeper (e.g. data/<model>/<name>_catalogue_1.json)
             for subdir in sorted(p.iterdir()):
                 if subdir.is_dir():
                     paths.extend(sorted(subdir.glob("*_catalogue*.json")))
@@ -92,6 +97,24 @@ def _collect_catalogue_paths(sources: list[str]) -> list[Path]:
         else:
             console.print(f"[yellow]Skipping unrecognised source: {src}[/yellow]")
     return paths
+
+
+def _expand_db_sources(sources: list[str]) -> list[str]:
+    """
+    Expand a mixed list of db paths/connection strings.
+    If an entry is a directory, it is replaced by all *.db files found inside it.
+    """
+    result = []
+    for src in sources:
+        p = Path(src)
+        if p.is_dir():
+            db_files = sorted(p.glob("*.db"))
+            if not db_files:
+                console.print(f"[yellow]No .db files found in directory: {src}[/yellow]")
+            result.extend(str(f) for f in db_files)
+        else:
+            result.append(src)
+    return result
 
 
 def _catalogue_entry(path: Path) -> dict | None:
@@ -620,7 +643,7 @@ def main() -> None:
 
     # Build stem → connection string map for every supplied database
     db_by_stem: dict[str, str] = {}
-    for db in args.dbs:
+    for db in _expand_db_sources(args.dbs):
         conn_str = _to_connection_string(db)
         stem = _db_stem(db)
         db_by_stem[stem] = conn_str
@@ -642,6 +665,15 @@ def main() -> None:
     if not matched:
         console.print("[red]No catalogues could be matched to the supplied databases.[/red]")
         sys.exit(1)
+
+    # ── Diagnostic summary ────────────────────────────────────────────────────
+    if not args.json:
+        console.print(f"\n[bold]Databases found ({len(db_by_stem)}):[/bold]")
+        for stem, conn in sorted(db_by_stem.items()):
+            n = len(matched.get(stem, []))
+            status = f"[green]{n} catalogue(s)[/green]" if n else "[yellow]no catalogues matched[/yellow]"
+            console.print(f"  {stem}  [dim]({conn})[/dim]  →  {status}")
+        console.print()
 
     json_output: dict[str, list[dict]] = {}
     judge_usage  = {"input_tokens": 0, "output_tokens": 0}
