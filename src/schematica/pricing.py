@@ -9,12 +9,21 @@ Three-tier pricing lookup:
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
+import warnings
 from pathlib import Path
 
 _LITELLM_URL     = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 _LITELLM_TIMEOUT = 3  # seconds
-_DEFAULT_CACHE_PATH = Path.home() / ".cache" / "schematica" / "model_pricing.json"
+
+def _default_cache_path() -> Path:
+    """Return the cache path, respecting $XDG_CACHE_HOME if set."""
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "schematica" / "model_pricing.json"
+
+_DEFAULT_CACHE_PATH = _default_cache_path()
 
 CACHE_WRITE_MULTIPLIER = 1.25
 CACHE_READ_MULTIPLIER  = 0.10
@@ -77,8 +86,14 @@ def _save_cache(pricing: dict, cache_path: Path) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "w") as f:
             json.dump(pricing, f, indent=2)
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"Could not write pricing cache to {cache_path}: {exc}. "
+            "Live pricing will be fetched on every run. "
+            "Set $XDG_CACHE_HOME to a writable directory to fix this.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def build_pricing_table(
