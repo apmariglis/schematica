@@ -35,7 +35,8 @@ from schematica.pricing import format_cost
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from sqlalchemy import create_engine, inspect as sqla_inspect
+from sqlalchemy import inspect as sqla_inspect
+from schematica.db import make_readonly_engine
 
 from schematica.eval import (
     evaluate_metric,
@@ -568,7 +569,7 @@ def main() -> None:
                 f"[dim]Evaluating {len(entries)} catalogue(s) for [bold]{db_name}[/bold]…[/dim]"
             )
 
-        engine = create_engine(conn_str)
+        engine = make_readonly_engine(conn_str)
         schema_text = _db_schema_text(engine) if args.judge else ""
 
         rows = []

@@ -34,7 +34,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from sqlalchemy import create_engine
+from schematica.db import make_readonly_engine
 
 from schematica.eval import (
     MetricResult, FactResult,
@@ -363,7 +363,7 @@ def main() -> None:
         console.print("[red]No measurable_metrics or queryable_facts found in catalogue.[/red]")
         sys.exit(1)
 
-    engine = create_engine(db_string)
+    engine = make_readonly_engine(db_string)
     icon = {"PASS": "[green]✓[/green]", "WARN": "[yellow]⚠[/yellow]", "FAIL": "[red]✗[/red]"}
 
     if not args.json:

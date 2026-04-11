@@ -19,7 +19,7 @@ from urllib.parse import urlparse, urlunparse
 
 from sqlalchemy import inspect, text
 
-from schematica.db import make_engine
+from schematica.db import make_readonly_engine
 
 
 # Column name fragments that suggest a date/time value even when stored as TEXT
@@ -62,7 +62,7 @@ def introspect(connection_string: str) -> dict:
       ]
     }
     """
-    engine = make_engine(connection_string)
+    engine = make_readonly_engine(connection_string)
     insp   = inspect(engine)
     dialect = engine.dialect.name
 

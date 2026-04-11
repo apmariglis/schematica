@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 from sqlalchemy import text
 
-from schematica.db import make_engine
+from schematica.db import make_readonly_engine
 
 
 class DataAccessBroker:
@@ -47,7 +47,7 @@ class DataAccessBroker:
         self._facts: dict[str, dict] = {
             f["name"]: f for f in raw.get("queryable_facts", [])
         }
-        self._engine = make_engine(connection_string)
+        self._engine = make_readonly_engine(connection_string)
 
     # ── public API ─────────────────────────────────────────────────────────────
 
