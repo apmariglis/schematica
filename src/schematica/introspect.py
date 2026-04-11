@@ -56,7 +56,7 @@ def introspect(connection_string: str) -> dict:
               }
             }
           ],
-          "foreign_keys": [{"from_col", "to_table", "to_col"}],
+          "foreign_keys": [{"from_cols": [...], "to_table": str, "to_cols": [...]}],
           "sample_rows": [...]   # up to 5 rows as dicts
         }
       ]
@@ -100,7 +100,9 @@ def render_as_text(snapshot: dict) -> str:
                 detail = f"distinct={s['n_distinct']}  top=[{top_str}]  nulls={s['n_null']}"
             lines.append(f"  {c['name']}{pk}  {c['type']}{req}  — {detail}")
         for fk in t["foreign_keys"]:
-            lines.append(f"  FK: {fk['from_col']} → {fk['to_table']}.{fk['to_col']}")
+            from_str = ", ".join(fk["from_cols"])
+            to_str   = ", ".join(fk["to_cols"])
+            lines.append(f"  FK: ({from_str}) → {fk['to_table']}.({to_str})")
         if t["sample_rows"]:
             lines.append(f"  SAMPLE ROW: {json.dumps(t['sample_rows'][0], default=str)}")
         lines.append("")
@@ -129,9 +131,9 @@ def _introspect_table(engine, insp, table_name: str) -> dict:
     pk_cols = set(insp.get_pk_constraint(table_name).get("constrained_columns", []))
     fk_list = [
         {
-            "from_col": fk["constrained_columns"][0],
-            "to_table": fk["referred_table"],
-            "to_col":   fk["referred_columns"][0],
+            "from_cols": fk["constrained_columns"],
+            "to_table":  fk["referred_table"],
+            "to_cols":   fk["referred_columns"],
         }
         for fk in insp.get_foreign_keys(table_name)
         if fk["constrained_columns"] and fk["referred_columns"]

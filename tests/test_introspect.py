@@ -204,3 +204,50 @@ def test_render_as_text_includes_dialect(populated_db):
     output = render_as_text(snapshot)
 
     assert "sqlite" in output.lower()
+
+
+# ── foreign keys ───────────────────────────────────────────────────────────────
+
+@pytest.fixture()
+def composite_fk_db(tmp_path):
+    """
+    A database with a junction table that has a composite foreign key:
+      registrations(event_id, attendee_id) → events(id) + attendees(id)
+    """
+    db_path = tmp_path / "composite.db"
+    cs = f"sqlite:///{db_path}"
+    eng = create_engine(cs)
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE events   (id INTEGER PRIMARY KEY)"))
+        conn.execute(text("CREATE TABLE attendees (id INTEGER PRIMARY KEY)"))
+        conn.execute(text("""
+            CREATE TABLE registrations (
+                event_id    INTEGER NOT NULL REFERENCES events(id),
+                attendee_id INTEGER NOT NULL REFERENCES attendees(id),
+                PRIMARY KEY (event_id, attendee_id)
+            )
+        """))
+    return cs
+
+
+def test_introspect_captures_all_columns_of_composite_foreign_key(composite_fk_db):
+    snapshot = introspect(composite_fk_db)
+
+    reg = next(t for t in snapshot["tables"] if t["name"] == "registrations")
+    fk_to_events   = next(fk for fk in reg["foreign_keys"] if fk["to_table"] == "events")
+    fk_to_attendees = next(fk for fk in reg["foreign_keys"] if fk["to_table"] == "attendees")
+
+    # Each FK must expose a list of columns, not a single truncated string
+    assert fk_to_events["from_cols"]   == ["event_id"]
+    assert fk_to_events["to_cols"]     == ["id"]
+    assert fk_to_attendees["from_cols"] == ["attendee_id"]
+    assert fk_to_attendees["to_cols"]   == ["id"]
+
+
+def test_render_as_text_shows_all_columns_of_composite_foreign_key(composite_fk_db):
+    snapshot = introspect(composite_fk_db)
+
+    output = render_as_text(snapshot)
+
+    assert "event_id" in output
+    assert "attendee_id" in output
