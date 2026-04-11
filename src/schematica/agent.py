@@ -930,6 +930,23 @@ def _decode_sql_error(exc: Exception) -> str:
     return msg.split("\n")[0][:200]
 
 
+def _select_phase3_result(
+    refined: DataCatalogue,
+    patched: DataCatalogue,
+) -> tuple[DataCatalogue, bool]:
+    """
+    Choose between the refined catalogue and the fallback (directly-patched) catalogue.
+
+    Returns (chosen_catalogue, did_fallback).
+    Falls back to patched when refined is completely empty — this happens when
+    _drop_broken_sql removes all metrics because the refinement agent hallucinated
+    column names or submitted otherwise unrunnable SQL.
+    """
+    if not refined.measurable_metrics and not refined.queryable_facts:
+        return patched, True
+    return refined, False
+
+
 def _drop_broken_sql(catalogue: DataCatalogue, engine) -> DataCatalogue:
     """
     Run each metric and queryable fact SQL against the engine with LIMIT 1.
@@ -1177,6 +1194,26 @@ def _run_phase3(
         "tables":            [],
     })
     refined_catalogue = _drop_broken_sql(refined_catalogue, engine)
+
+    patched_catalogue = catalogue.model_copy(update={"measurable_metrics": list(patched_metrics.values())})
+    refined_catalogue, did_fallback = _select_phase3_result(refined_catalogue, patched_catalogue)
+
+    if did_fallback:
+        console.print(
+            "[yellow]  ⚠ Refinement produced an empty catalogue after SQL validation "
+            "(all metrics had broken SQL) — falling back to the directly-patched catalogue.[/yellow]"
+        )
+        final_mr = [evaluate_metric(engine, m.model_dump()) for m in refined_catalogue.measurable_metrics]
+        final_fr = [evaluate_fact(engine, f.model_dump())   for f in refined_catalogue.queryable_facts]
+        return refined_catalogue, final_mr, final_fr, uncovered
+
+    n_orig    = len(catalogue.measurable_metrics)
+    n_refined = len(refined_catalogue.measurable_metrics)
+    if n_orig > 0 and n_refined < n_orig * 0.5:
+        console.print(
+            f"[yellow]  ⚠ Refinement dropped {n_orig - n_refined} of {n_orig} metrics "
+            f"({n_refined} remain). Consider re-running with a larger refinement budget.[/yellow]"
+        )
 
     # ── phase 3 summary ───────────────────────────────────────────────────────
     orig_names    = {m.name for m in catalogue.measurable_metrics}
