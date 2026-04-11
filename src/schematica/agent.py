@@ -192,8 +192,11 @@ General rules:
   schema snapshot. If a query returns a column error, look up the exact column name \
   in the schema snapshot and fix the SQL before retrying. Never guess.
 - Cover all tables in the tables summary, even those with no measurable metrics.
-- Include every distinct measurable metric — do not artificially limit the count. \
-  A complex database should have more metrics than a simple one.
+- Aim for quality over quantity: target 3–5 metrics per table, up to ~70 metrics \
+  total for large databases. A complex database does not need every possible \
+  permutation — prefer the most insightful and distinct metrics over exhaustive \
+  coverage. If many breakdowns of the same base metric are possible, pick the most \
+  useful 2–3; do not generate one metric per categorical value.
 - time_range start and end must align to the metric's granularity boundary: \
   for monthly metrics both dates must be the first day of a month; for annual \
   metrics the first day of a year. Use the snapshot column min/max and truncate \
@@ -714,10 +717,14 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
                 rejection_reasons = []
                 if block.input.get("_compressed"):
                     rejection_reasons.append(
-                        "You submitted a compressed placeholder — this is not a valid catalogue. "
-                        "You must submit a completely new finish_catalogue where tables, "
-                        "measurable_metrics, and queryable_facts are full objects with all required "
-                        "fields (name, description, sql, etc.) — not just a list of names."
+                        "Your previous finish_catalogue was truncated mid-response because the JSON "
+                        "was too large for the output token limit. You must resubmit a smaller catalogue. "
+                        "Cut it down to the most important metrics: aim for 3–5 per table, ~70 total. "
+                        "Drop low-value breakdowns and near-duplicate metrics. "
+                        "Keep agent_notes and descriptions to one sentence each. "
+                        "Every item must be a full object with all required fields "
+                        "(name, description, sql, time_range, granularity, unit, tables_used, "
+                        "confidence, agent_notes) — not just a name."
                     )
                 if not rejection_reasons and i < min_iter:
                     remaining = min_iter - i
