@@ -112,13 +112,14 @@ def render_as_text(snapshot: dict) -> str:
 def _redact(connection_string: str) -> str:
     try:
         p = urlparse(connection_string)
-        if p.password:
-            netloc = p.hostname or ""
-            if p.username:
-                netloc = f"{p.username}:***@{netloc}"
-            if p.port:
-                netloc = f"{netloc}:{p.port}"
-            p = p._replace(netloc=netloc)
+        if not p.password:
+            return connection_string
+        netloc = p.hostname or ""
+        if p.username:
+            netloc = f"{p.username}:***@{netloc}"
+        if p.port:
+            netloc = f"{netloc}:{p.port}"
+        p = p._replace(netloc=netloc)
         return urlunparse(p)
     except Exception:
         return connection_string
