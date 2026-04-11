@@ -1682,14 +1682,25 @@ def _derive_catalogue_path(connection_string: str) -> str:
     return str(out_dir / f"{db_name}_catalogue_{idx}.json")
 
 
+_KNOWN_SCHEMES = ("sqlite:///", "postgresql://", "mysql://", "mssql://", "oracle://")
+
+
+def _to_connection_string(db: str) -> str:
+    """Convert a file path to a SQLite connection string; pass through existing connection strings."""
+    if any(db.startswith(s) for s in _KNOWN_SCHEMES):
+        return db
+    return f"sqlite:///{db}"
+
+
 def main() -> None:
     """
     Console script entry point.
 
     Usage:
-      schematica --db sqlite:///data/solar_wind.db
+      schematica --db path/to/mydb.db
+      schematica --db sqlite:///path/to/mydb.db
       schematica --db postgresql://user:pass@host:5432/mydb
-      schematica --db sqlite:///data/solar_wind.db --out path/to/custom.json
+      schematica --db path/to/mydb.db --out path/to/custom.json
     """
     import argparse
     import sys
@@ -1697,17 +1708,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Schematica — analyse a database and produce a data catalogue.",
     )
-    parser.add_argument("--db", required=True, metavar="CONNECTION_STRING",
-                        help="SQLAlchemy connection string")
+    parser.add_argument("--db", required=True, metavar="DB",
+                        help="Database file path (e.g. ./data/mydb.db) or SQLAlchemy connection string")
     parser.add_argument("--out", default=None, metavar="OUTPUT_JSON",
                         help="Path to write the catalogue JSON (default: <db_stem>_catalogue.json)")
     args = parser.parse_args()
 
-    out_path = args.out or _derive_catalogue_path(args.db)
+    connection_string = _to_connection_string(args.db)
+    out_path = args.out or _derive_catalogue_path(connection_string)
     print(f"Output → {out_path}", file=sys.stderr)
 
     try:
-        run(connection_string=args.db, out_path=out_path)
+        run(connection_string=connection_string, out_path=out_path)
     except KeyboardInterrupt:
         print("\nAborted.", file=sys.stderr)
         sys.exit(1)

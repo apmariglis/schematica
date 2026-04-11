@@ -325,28 +325,23 @@ def print_json_report(results: list[MetricResult], fact_results: list[FactResult
 
 # ── entry point ────────────────────────────────────────────────────────────────
 
-def _derive_db_string(catalogue_path: Path) -> str | None:
-    """
-    Derive a SQLite connection string from a catalogue path.
+_KNOWN_SCHEMES = ("sqlite:///", "postgresql://", "mysql://", "mssql://", "oracle://")
 
-    data/solar_wind_catalogue.json  →  sqlite:///data/solar_wind.db
-    Returns None if the expected .db file does not exist.
-    """
-    stem = catalogue_path.stem  # e.g. solar_wind_catalogue
-    if not stem.endswith("_catalogue"):
-        return None
-    db_path = catalogue_path.parent / f"{stem[:-len('_catalogue')]}.db"
-    return f"sqlite:///{db_path}" if db_path.exists() else None
+
+def _to_connection_string(db: str) -> str:
+    if any(db.startswith(s) for s in _KNOWN_SCHEMES):
+        return db
+    return f"sqlite:///{db}"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate a data_catalogue.json against a live database."
     )
+    parser.add_argument("--db", required=True, metavar="DB",
+                        help="Database file path (e.g. ./data/mydb.db) or SQLAlchemy connection string")
     parser.add_argument("--catalogue", required=True, metavar="PATH",
                         help="Path to *_catalogue.json")
-    parser.add_argument("--db", default=None, metavar="CONNECTION_STRING",
-                        help="SQLAlchemy connection string (default: inferred from catalogue name)")
     parser.add_argument("--json", action="store_true",
                         help="Output a machine-readable JSON report instead of the rich table")
     args = parser.parse_args()
@@ -356,13 +351,7 @@ def main() -> None:
         console.print(f"[red]Catalogue not found: {catalogue_path}[/red]")
         sys.exit(1)
 
-    db_string = args.db or _derive_db_string(catalogue_path)
-    if not db_string:
-        console.print(
-            f"[red]Could not find a matching .db file for {catalogue_path.name}. "
-            "Pass --db explicitly.[/red]"
-        )
-        sys.exit(1)
+    db_string = _to_connection_string(args.db)
 
     with open(catalogue_path) as f:
         catalogue = json.load(f)
