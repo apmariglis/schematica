@@ -33,6 +33,38 @@ def make_engine(connection_string: str) -> Engine:
     return create_engine(connection_string)
 
 
+def prompt_readonly_confirmation(connection_string: str, skip: bool = False) -> None:
+    """
+    For non-SQLite connections, warn the user that schematica cannot enforce
+    read-only access at the driver level and ask them to confirm they are
+    connecting with a read-only database user.
+
+    Silently returns for SQLite (mode=ro is enforced at the driver level).
+    Pass skip=True to suppress the prompt in automated / CI contexts.
+    """
+    if connection_string.startswith("sqlite") or skip:
+        return
+
+    print(
+        "\n"
+        "  ┌─────────────────────────────────────────────────────────────────┐\n"
+        "  │  ⚠  READ-ONLY ACCESS WARNING                                    │\n"
+        "  │                                                                  │\n"
+        "  │  Schematica cannot enforce read-only access at the driver level  │\n"
+        "  │  for non-SQLite databases.                                       │\n"
+        "  │                                                                  │\n"
+        "  │  You should connect with a database user that has only SELECT    │\n"
+        "  │  privileges. Connecting as a user with write access exposes your │\n"
+        "  │  database to unintended modifications.                           │\n"
+        "  │                                                                  │\n"
+        "  │  Use --skip-ro-check to suppress this prompt (e.g. in CI).      │\n"
+        "  └─────────────────────────────────────────────────────────────────┘\n"
+    )
+    answer = input("  Have you connected with a read-only database user? [y/N] ").strip().lower()
+    if answer != "y":
+        print("  Aborted. Reconnect with a read-only user or use --skip-ro-check.")
+        raise SystemExit(1)
+
 def make_readonly_engine(connection_string: str) -> Engine:
     """
     Return a read-only Engine for use during exploration queries.

@@ -34,7 +34,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from schematica.db import make_readonly_engine
+from schematica.db import make_readonly_engine, prompt_readonly_confirmation
 
 from schematica.eval import (
     MetricResult, FactResult,
@@ -344,14 +344,17 @@ def main() -> None:
                         help="Path to *_catalogue.json")
     parser.add_argument("--json", action="store_true",
                         help="Output a machine-readable JSON report instead of the rich table")
+    parser.add_argument("--skip-ro-check", action="store_true",
+                        help="Skip the read-only user confirmation prompt (for CI / automated use)")
     args = parser.parse_args()
+
+    db_string = _to_connection_string(args.db)
+    prompt_readonly_confirmation(db_string, skip=args.skip_ro_check)
 
     catalogue_path = Path(args.catalogue)
     if not catalogue_path.exists():
         console.print(f"[red]Catalogue not found: {catalogue_path}[/red]")
         sys.exit(1)
-
-    db_string = _to_connection_string(args.db)
 
     with open(catalogue_path) as f:
         catalogue = json.load(f)

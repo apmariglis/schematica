@@ -36,7 +36,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from sqlalchemy import inspect as sqla_inspect
-from schematica.db import make_readonly_engine
+from schematica.db import make_readonly_engine, prompt_readonly_confirmation
 
 from schematica.eval import (
     evaluate_metric,
@@ -542,10 +542,13 @@ def main() -> None:
             "SQL against its name/description (1–5). Requires GOOGLE_API_KEY."
         ),
     )
+    parser.add_argument("--skip-ro-check", action="store_true",
+                        help="Skip the read-only user confirmation prompt (for CI / automated use)")
     args = parser.parse_args()
 
     started_at = time.monotonic()
     conn_str = _to_connection_string(args.db)
+    prompt_readonly_confirmation(conn_str, skip=args.skip_ro_check)
     db_stem  = _db_stem(args.db)
 
     data_dir = Path(args.data)

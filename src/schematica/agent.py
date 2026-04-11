@@ -34,7 +34,7 @@ from rich.panel import Panel
 from rich.text import Text
 from sqlalchemy import text
 
-from schematica.db import make_readonly_engine
+from schematica.db import make_readonly_engine, prompt_readonly_confirmation
 
 from schematica.catalogue import DataCatalogue
 from schematica.eval import evaluate_metric, evaluate_fact
@@ -1718,9 +1718,12 @@ def main() -> None:
                         help="Database file path (e.g. ./data/mydb.db) or SQLAlchemy connection string")
     parser.add_argument("--out", default=None, metavar="OUTPUT_JSON",
                         help="Path to write the catalogue JSON (default: <db_stem>_catalogue.json)")
+    parser.add_argument("--skip-ro-check", action="store_true",
+                        help="Skip the read-only user confirmation prompt (for CI / automated use)")
     args = parser.parse_args()
 
     connection_string = _to_connection_string(args.db)
+    prompt_readonly_confirmation(connection_string, skip=args.skip_ro_check)
     out_path = args.out or _derive_catalogue_path(connection_string)
     print(f"Output → {out_path}", file=sys.stderr)
 
