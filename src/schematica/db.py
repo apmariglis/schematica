@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from sqlalchemy import event, create_engine
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 
@@ -37,14 +37,15 @@ def make_readonly_engine(connection_string: str) -> Engine:
     """
     Return a read-only Engine for use during exploration queries.
 
-    Guarantees that no SQL can alter the database, regardless of what the agent
-    produces:
-
     - SQLite: opens the file with mode=ro via the SQLite URI interface — the
       driver itself refuses writes at the OS level, including DDL that would
       normally auto-commit past a transaction boundary.
-    - All other databases: registers a before_cursor_execute listener that raises
-      PermissionError before any non-SELECT statement reaches the wire.
+    - All other databases: returns a standard engine. SQLAlchemy runs its own
+      internal session-management statements (SET, SHOW, PRAGMA) during
+      connection setup and introspection; a blanket first-token listener would
+      block those and break schema discovery. For PostgreSQL, MySQL, and other
+      dialects the read-only guarantee must be enforced at the database level
+      by connecting with a user that has only SELECT privileges.
     """
     if connection_string.startswith("sqlite"):
         db_path = connection_string.split("///", 1)[-1]
@@ -56,14 +57,4 @@ def make_readonly_engine(connection_string: str) -> Engine:
 
         return create_engine("sqlite://", creator=_readonly_creator)
 
-    engine = create_engine(connection_string)
-
-    @event.listens_for(engine, "before_cursor_execute")
-    def _reject_writes(conn, cursor, statement, parameters, context, executemany):
-        first_token = statement.strip().split()[0].upper() if statement.strip() else ""
-        if first_token not in ("SELECT", "WITH", "EXPLAIN"):
-            raise PermissionError(
-                f"Write operations are not permitted during exploration: {first_token}"
-            )
-
-    return engine
+    return create_engine(connection_string)
