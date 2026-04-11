@@ -97,7 +97,7 @@ uv run python scripts/compare_catalogues.py \
     --judge
 ```
 
-`--catalogues` accepts either a directory (whose immediate subfolders are scanned for `*_catalogue*.json` files) or an explicit list of JSON files. Each catalogue is matched to its database via the `connection` field stored inside the catalogue JSON — so mixing databases and scattered files all works. The model label is taken from the catalogue file's parent directory name.
+`--dbs` accepts file paths (`.db`, `.sqlite`), SQLAlchemy connection strings, or a directory (expanded to all `.db` and `.sqlite` files inside it). `--catalogues` accepts a directory (catalogues found directly inside it and in its immediate subfolders are included) or an explicit list of JSON files. Each catalogue is matched to its database via the `connection` field stored inside the catalogue JSON — so mixing databases and scattered files all works. The model label is taken from the catalogue file's parent directory name.
 
 ---
 
@@ -115,7 +115,7 @@ uv run python scripts/compare_catalogues.py \
       "description": "Total revenue per month",
       "sql": "SELECT DATE_TRUNC(created_at, MONTH), SUM(amount) FROM orders GROUP BY 1",
       "time_range": {"start": "2022-01-01", "end": "2024-12-31"},
-      "granularity": "monthly",
+      "granularity": "monthly",   // daily | weekly | monthly | quarterly | annual | tick
       "unit": "€",
       "tables_used": ["orders"],
       "confidence": "high",
@@ -203,7 +203,7 @@ Run `uv sync --extra litellm`. The base install only includes the Anthropic SDK.
 Check that the correct key is set in `.env` for your provider (see the table in Getting started, step 2).
 
 **`OperationalError: unable to open database file`**
-The path passed to `--db` does not exist. Check the path and working directory.
+The path passed to `--db` / `--dbs` does not exist. Check the path and working directory.
 
 **`OperationalError: attempt to write a readonly database`**
 Schematica opens SQLite in read-only mode (`mode=ro`). If you see this for a non-SQLite database, the connected user has write access — connect with a read-only user.
