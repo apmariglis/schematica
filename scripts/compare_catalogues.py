@@ -670,9 +670,13 @@ def main() -> None:
     if not args.json:
         console.print(f"\n[bold]Databases found ({len(db_by_stem)}):[/bold]")
         for stem, conn in sorted(db_by_stem.items()):
-            n = len(matched.get(stem, []))
-            status = f"[green]{n} catalogue(s)[/green]" if n else "[yellow]no catalogues matched[/yellow]"
-            console.print(f"  {stem}  [dim]({conn})[/dim]  →  {status}")
+            entries = matched.get(stem, [])
+            if entries:
+                console.print(f"  [bold]{stem}[/bold]  [dim]({conn})[/dim]  [green]{len(entries)} catalogue(s)[/green]")
+                for e in sorted(entries, key=lambda e: (e["model"], e["index"])):
+                    console.print(f"    [dim]{e['path']}[/dim]")
+            else:
+                console.print(f"  [bold]{stem}[/bold]  [dim]({conn})[/dim]  [yellow]no catalogues matched[/yellow]")
         console.print()
 
     json_output: dict[str, list[dict]] = {}
