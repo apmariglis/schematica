@@ -73,25 +73,31 @@ Runs every metric and queryable fact against the live database and produces a qu
 Run schematica multiple times with different `SC_MODEL` values, then compare the catalogues they produced:
 
 ```bash
+# scan a data directory for all matching catalogues
 uv run python scripts/compare_catalogues.py \
-    --db path/to/sales.db \
-    --data data/
+    --dbs path/to/mydb.db \
+    --catalogues data/
 
+# multiple databases
 uv run python scripts/compare_catalogues.py \
-    --db path/to/sales.db \
-    --data data/ \
-    --judge   # adds LLM semantic scoring of metric descriptions
+    --dbs path/to/db1.db postgresql://user:pw@host/db2 \
+    --catalogues data/
+
+# catalogues scattered across different folders
+uv run python scripts/compare_catalogues.py \
+    --dbs path/to/mydb.db \
+    --catalogues runs/2025-01/mydb_catalogue_1.json \
+                 runs/2025-02/mydb_catalogue_1.json \
+                 team/alice/mydb_catalogue_1.json
+
+# add LLM semantic scoring of metric descriptions
+uv run python scripts/compare_catalogues.py \
+    --dbs path/to/mydb.db \
+    --catalogues data/ \
+    --judge
 ```
 
-`--db` determines which catalogues to compare: the stem is extracted (e.g. `sales` from `sales.db`) and the script finds all files matching `data/*/sales_catalogue_*.json`. Given a layout like:
-
-```
-data/
-  gemini-2.5-flash/sales_catalogue_1.json
-  claude-sonnet-4/sales_catalogue_1.json
-```
-
-…it loads one catalogue per model and produces a side-by-side comparison.
+`--catalogues` accepts either a directory (whose immediate subfolders are scanned for `*_catalogue*.json` files) or an explicit list of JSON files. Each catalogue is matched to its database via the `connection` field stored inside the catalogue JSON — so mixing databases and scattered files all works. The model label is taken from the catalogue file's parent directory name.
 
 ---
 

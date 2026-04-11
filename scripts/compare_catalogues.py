@@ -1,17 +1,39 @@
 """
 compare_catalogues.py — Cross-model catalogue quality comparison.
 
-Scans every subfolder of ./data/ for files matching *_catalogue_*.json,
-groups them by database name, and produces a side-by-side quality report.
-
-Folder/file convention (produced by agent.py):
-  data/<model>/<db_name>_catalogue_<n>.json
+Accepts explicit database connections and catalogue files (or a directory),
+matches each catalogue to its database, and produces a side-by-side quality
+report.
 
 Usage:
-  uv run python scripts/compare_catalogues.py
-  uv run python scripts/compare_catalogues.py --data data/
-  uv run python scripts/compare_catalogues.py --db solar_wind   # one DB only
-  uv run python scripts/compare_catalogues.py --json
+  # scan a whole data directory for all catalogues
+  uv run python scripts/compare_catalogues.py \\
+      --dbs path/to/mydb.db \\
+      --catalogues data/
+
+  # multiple databases, one data directory
+  uv run python scripts/compare_catalogues.py \\
+      --dbs path/to/db1.db postgresql://user:pw@host/db2 \\
+      --catalogues data/
+
+  # catalogues scattered across different folders
+  uv run python scripts/compare_catalogues.py \\
+      --dbs path/to/mydb.db \\
+      --catalogues runs/2025-01-10/mydb_catalogue_1.json \\
+                   runs/2025-02-14/mydb_catalogue_1.json \\
+                   team/alice/mydb_catalogue_1.json
+
+  # multiple databases, catalogues scattered across different folders
+  uv run python scripts/compare_catalogues.py \\
+      --dbs path/to/db1.db path/to/db2.db \\
+      --catalogues runs/gemini/db1_catalogue_1.json \\
+                   runs/claude/db1_catalogue_1.json \\
+                   archive/db2_catalogue_1.json \\
+                   team/alice/db2_catalogue_1.json
+
+Each catalogue JSON is matched to its database by comparing the stem of the
+`connection` field stored inside the catalogue against the stem of each --dbs
+entry. The model label is taken from the catalogue file's parent directory name.
 """
 from __future__ import annotations
 
@@ -49,30 +71,71 @@ console = Console()
 
 # ── Discovery ──────────────────────────────────────────────────────────────────
 
-def discover_catalogues(data_dir: Path) -> dict[str, list[dict]]:
-    """
-    Return {db_name: [entry, ...]} where each entry is:
-      {"model": str, "index": int, "path": Path}
+_CATALOGUE_INDEX_RE = re.compile(r"_catalogue(?:_(\d+))?\.json$")
 
-    Matches any *_catalogue*.json inside a single-level subfolder of data_dir.
-    The subfolder name is used as the model name.
-    The numeric suffix (if present) is used as the index; otherwise defaults to 1.
+
+def _collect_catalogue_paths(sources: list[str]) -> list[Path]:
+    """
+    Expand a mixed list of directories and explicit JSON file paths into a flat
+    list of catalogue JSON paths. Directories are scanned one level deep for
+    *_catalogue*.json files in their immediate subfolders.
+    """
+    paths: list[Path] = []
+    for src in sources:
+        p = Path(src)
+        if p.is_dir():
+            for subdir in sorted(p.iterdir()):
+                if subdir.is_dir():
+                    paths.extend(sorted(subdir.glob("*_catalogue*.json")))
+        elif p.suffix == ".json":
+            paths.append(p)
+        else:
+            console.print(f"[yellow]Skipping unrecognised source: {src}[/yellow]")
+    return paths
+
+
+def _catalogue_entry(path: Path) -> dict | None:
+    """
+    Read a catalogue JSON and return an entry dict:
+      {"model": str, "index": int, "path": Path, "db_stem": str}
+
+    Returns None if the file cannot be read or lacks a connection field.
+    The model label is the parent directory name.
+    The db_stem is derived from the `connection` field stored in the catalogue.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as exc:
+        console.print(f"[yellow]Could not read {path}: {exc}[/yellow]")
+        return None
+
+    connection = data.get("connection", "")
+    if not connection:
+        console.print(f"[yellow]No connection field in {path} — skipping[/yellow]")
+        return None
+
+    m = _CATALOGUE_INDEX_RE.search(path.name)
+    index = int(m.group(1)) if m and m.group(1) else 1
+
+    return {
+        "model":   path.parent.name,
+        "index":   index,
+        "path":    path,
+        "db_stem": _db_stem(connection),
+    }
+
+
+def group_catalogues_by_db(sources: list[str]) -> dict[str, list[dict]]:
+    """
+    Return {db_stem: [entry, ...]} built from all catalogue files found in sources.
+    sources may be directories or explicit JSON file paths.
     """
     result: dict[str, list[dict]] = defaultdict(list)
-    pattern = re.compile(r"^(.+)_catalogue(?:_(\d+))?\.json$")
-
-    for subdir in sorted(data_dir.iterdir()):
-        if not subdir.is_dir():
-            continue
-        model_name = subdir.name
-        for json_file in sorted(subdir.glob("*_catalogue*.json")):
-            m = pattern.match(json_file.name)
-            if not m:
-                continue
-            db_name = m.group(1)
-            index   = int(m.group(2)) if m.group(2) else 1
-            result[db_name].append({"model": model_name, "index": index, "path": json_file})
-
+    for path in _collect_catalogue_paths(sources):
+        entry = _catalogue_entry(path)
+        if entry:
+            result[entry["db_stem"]].append(entry)
     return dict(result)
 
 
@@ -524,12 +587,19 @@ def main() -> None:
         description="Compare catalogues generated by different models for the same database."
     )
     parser.add_argument(
-        "--db", required=True, metavar="DB",
-        help="Database file path (e.g. ./data/mydb.db) or SQLAlchemy connection string",
+        "--dbs", nargs="+", required=True, metavar="DB",
+        help=(
+            "One or more database file paths or SQLAlchemy connection strings. "
+            "Each catalogue is matched to its database via the connection field "
+            "stored inside the catalogue JSON."
+        ),
     )
     parser.add_argument(
-        "--data", required=True, metavar="PATH",
-        help="Directory containing model subfolders with catalogues",
+        "--catalogues", nargs="+", required=True, metavar="PATH",
+        help=(
+            "One or more catalogue JSON files, or a directory whose immediate "
+            "subfolders are scanned for *_catalogue*.json files."
+        ),
     )
     parser.add_argument(
         "--json", action="store_true",
@@ -547,32 +617,43 @@ def main() -> None:
     args = parser.parse_args()
 
     started_at = time.monotonic()
-    conn_str = _to_connection_string(args.db)
-    prompt_readonly_confirmation(conn_str, skip=args.skip_ro_check)
-    db_stem  = _db_stem(args.db)
 
-    data_dir = Path(args.data)
-    if not data_dir.is_dir():
-        console.print(f"[red]Data directory not found: {data_dir}[/red]")
-        sys.exit(1)
+    # Build stem → connection string map for every supplied database
+    db_by_stem: dict[str, str] = {}
+    for db in args.dbs:
+        conn_str = _to_connection_string(db)
+        stem = _db_stem(db)
+        db_by_stem[stem] = conn_str
+        prompt_readonly_confirmation(conn_str, skip=args.skip_ro_check)
 
-    all_catalogues = discover_catalogues(data_dir)
-    if db_stem not in all_catalogues:
-        console.print(f"[red]No catalogues found for '{db_stem}' under {data_dir}/[/red]")
+    # Group catalogues by the db stem stored in their connection field
+    all_catalogues = group_catalogues_by_db(args.catalogues)
+
+    # Keep only stems that have a matching database in --dbs
+    matched: dict[str, list[dict]] = {}
+    for stem, entries in all_catalogues.items():
+        if stem in db_by_stem:
+            matched[stem] = entries
+        else:
+            console.print(
+                f"[yellow]No matching --dbs entry for catalogue db '{stem}' — skipping[/yellow]"
+            )
+
+    if not matched:
+        console.print("[red]No catalogues could be matched to the supplied databases.[/red]")
         sys.exit(1)
-    all_catalogues = {db_stem: all_catalogues[db_stem]}
 
     json_output: dict[str, list[dict]] = {}
     judge_usage  = {"input_tokens": 0, "output_tokens": 0}
     all_rows: list[dict] = []
 
-    for db_name, entries in sorted(all_catalogues.items()):
+    for db_stem, entries in sorted(matched.items()):
         if not args.json:
             console.print(
-                f"[dim]Evaluating {len(entries)} catalogue(s) for [bold]{db_name}[/bold]…[/dim]"
+                f"[dim]Evaluating {len(entries)} catalogue(s) for [bold]{db_stem}[/bold]…[/dim]"
             )
 
-        engine = make_readonly_engine(conn_str)
+        engine = make_readonly_engine(db_by_stem[db_stem])
         schema_text = _db_schema_text(engine) if args.judge else ""
 
         rows = []
@@ -597,10 +678,10 @@ def main() -> None:
         all_rows.extend(rows)
 
         if args.json:
-            json_output[db_name] = rows
+            json_output[db_stem] = rows
         else:
             console.print()
-            print_comparison(db_name, rows)
+            print_comparison(db_stem, rows)
 
     if args.json:
         print_json_output(json_output)
