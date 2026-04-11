@@ -15,6 +15,7 @@ The broker:
 from __future__ import annotations
 
 import json
+import warnings
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -90,6 +91,14 @@ class DataAccessBroker:
             raise KeyError(
                 f"No metric matching '{metric_name}' found in catalogue. "
                 f"Available metrics: {self.list_metrics()}"
+            )
+
+        if score < 1.0:
+            warnings.warn(
+                f"Fuzzy match: '{metric_name}' resolved to '{resolved_name}' "
+                f"(score={score:.2f}). Use the exact name to suppress this warning.",
+                UserWarning,
+                stacklevel=2,
             )
 
         metric = self._metrics[resolved_name]
