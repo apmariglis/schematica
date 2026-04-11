@@ -392,6 +392,76 @@ def test_evaluate_fact_warns_for_zero_rows(engine):
 
 # ── evaluate_metric — null date column ────────────────────────────────────────
 
+def test_date_col_ok_is_true_when_all_dates_parse():
+    eng = create_engine("sqlite:///:memory:")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (dt TEXT, val REAL)"))
+        conn.execute(text("""
+            INSERT INTO t VALUES
+                ('2024-01-01', 1.0),
+                ('2024-02-01', 2.0),
+                ('2024-03-01', 3.0)
+        """))
+    metric = {
+        "name": "clean", "confidence": "high", "granularity": "monthly",
+        "unit": "units", "time_range": {},
+        "sql": "SELECT dt, val FROM t ORDER BY dt",
+    }
+
+    result = evaluate_metric(eng, metric)
+
+    assert result.date_col_ok is True
+
+
+def test_date_col_ok_is_false_when_more_than_five_percent_of_dates_are_unparseable():
+    # 2 of 10 rows (20%) have unparseable dates — must trigger a warning
+    eng = create_engine("sqlite:///:memory:")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (dt TEXT, val REAL)"))
+        conn.execute(text("""
+            INSERT INTO t VALUES
+                ('2024-01-01', 1.0),
+                ('2024-02-01', 2.0),
+                ('2024-03-01', 3.0),
+                ('2024-04-01', 4.0),
+                ('2024-05-01', 5.0),
+                ('2024-06-01', 6.0),
+                ('2024-07-01', 7.0),
+                ('2024-08-01', 8.0),
+                ('NOT-A-DATE', 9.0),
+                ('ALSO-WRONG', 10.0)
+        """))
+    metric = {
+        "name": "bad_dates", "confidence": "high", "granularity": "monthly",
+        "unit": "units", "time_range": {},
+        "sql": "SELECT dt, val FROM t ORDER BY dt",
+    }
+
+    result = evaluate_metric(eng, metric)
+
+    # 20% unparseable — must fail the date column check
+    assert result.date_col_ok is False
+
+
+def test_date_col_ok_is_true_when_fewer_than_five_percent_are_unparseable():
+    # 1 of 100 rows (1%) is unparseable — should still pass
+    eng = create_engine("sqlite:///:memory:")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (dt TEXT, val REAL)"))
+        rows = [(f"2020-{(i%12)+1:02d}-01", float(i)) for i in range(1, 100)]
+        rows.append(("NOT-A-DATE", 100.0))  # 1% bad
+        conn.execute(text("INSERT INTO t VALUES " + ", ".join(f"('{d}', {v})" for d, v in rows)))
+    metric = {
+        "name": "mostly_clean", "confidence": "high", "granularity": "monthly",
+        "unit": "units", "time_range": {},
+        "sql": "SELECT dt, val FROM t ORDER BY dt",
+    }
+
+    result = evaluate_metric(eng, metric)
+
+    assert result.date_col_ok is True
+
+
 def test_n_rows_reflects_non_null_value_rows_only():
     # When some value rows are non-numeric (become NaN after coercion), n_rows
     # should count only the rows with valid numeric values — matching what

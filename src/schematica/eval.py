@@ -17,7 +17,7 @@ from sqlalchemy import text
 
 WARN_NULL_RATE      = 0.10   # >10 % nulls → WARN
 WARN_MIN_ROWS       = 3      # fewer than 3 rows → WARN
-WARN_DATE_PARSE_PCT = 0.20   # >20 % of col-0 values unparseable as dates → WARN
+WARN_DATE_PARSE_PCT = 0.05   # >5 % of col-0 values unparseable as dates → WARN
 
 
 class MetricResult:
