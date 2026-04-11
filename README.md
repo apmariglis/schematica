@@ -21,37 +21,75 @@ Every metric and fact is executed against the full database. Issues like wrong s
 
 ---
 
-## Installation
+## Getting started
+
+**1. Install**
 
 ```bash
-# requires uv
-uv sync
-
-# with LiteLLM support (for Gemini and other providers)
-uv sync --extra litellm
+uv sync                        # Anthropic only
+uv sync --extra litellm        # add Gemini and other providers
 ```
 
-Copy `.env.example` to `.env` and fill in your API key and model choice.
+**2. Configure**
 
----
+Copy `.env.example` to `.env` and set the API key for your provider:
 
-## Usage
+| Provider | Key | Model prefix |
+|---|---|---|
+| Gemini | `GOOGLE_API_KEY` | `gemini/gemini-2.5-flash` |
+| Anthropic | `ANTHROPIC_API_KEY` | `anthropic/claude-sonnet-4-20250514` |
+
+Set `SC_MODEL` in `.env` to your chosen model. Gemini is the default — it performs well and is cheap to run.
+
+**3. Run against a database**
+
+Pass a file path or a full SQLAlchemy connection string — both work:
 
 ```bash
-# Analyse a database — output goes to <db_dir>/<model>/<db>_catalogue_<n>.json
-uv run schematica --db sqlite:///path/to/mydb.db
-
-# Specify a custom output path
-uv run schematica --db sqlite:///path/to/mydb.db --out path/to/catalogue.json
-
-# Evaluate an existing catalogue
-uv run python scripts/eval_catalogue.py --catalogue path/to/mydb_catalogue_1.json
-
-# Compare catalogues produced by different models for the same database
-uv run python scripts/compare_catalogues.py --data path/to/catalogues/
-uv run python scripts/compare_catalogues.py --data path/to/catalogues/ --db mydb
-uv run python scripts/compare_catalogues.py --data path/to/catalogues/ --judge   # adds LLM semantic scoring
+uv run schematica --db path/to/mydb.db                     # SQLite file path (auto-converted)
+uv run schematica --db sqlite:///path/to/mydb.db           # explicit SQLite connection string
+uv run schematica --db postgresql://user:pw@host/mydb      # PostgreSQL
+uv run schematica --db mysql://user:pw@host/mydb           # MySQL
+uv run schematica --db mssql+pyodbc://user:pw@dsn          # SQL Server
+uv run schematica --db oracle+cx_oracle://user:pw@host/sid # Oracle
 ```
+
+Any database supported by SQLAlchemy works. Output is written to `<db_dir>/<model>/<db_stem>_catalogue_<n>.json`. For example, running against `data/sales.db` with `gemini-2.5-flash` produces `data/gemini-2.5-flash/sales_catalogue_1.json`. Each run gets an auto-incremented index so repeated runs never overwrite each other.
+
+**4. Evaluate the catalogue**
+
+```bash
+uv run python scripts/eval_catalogue.py \
+    --db path/to/mydb.db \
+    --catalogue path/to/mydb_catalogue_1.json
+```
+
+Runs every metric and queryable fact against the live database and produces a quality report (pass/warn/fail per metric, null rates, date range accuracy, table coverage).
+
+**5. Compare models**
+
+Run schematica multiple times with different `SC_MODEL` values, then compare the catalogues they produced:
+
+```bash
+uv run python scripts/compare_catalogues.py \
+    --db path/to/sales.db \
+    --data data/
+
+uv run python scripts/compare_catalogues.py \
+    --db path/to/sales.db \
+    --data data/ \
+    --judge   # adds LLM semantic scoring of metric descriptions
+```
+
+`--db` determines which catalogues to compare: the stem is extracted (e.g. `sales` from `sales.db`) and the script finds all files matching `data/*/sales_catalogue_*.json`. Given a layout like:
+
+```
+data/
+  gemini-2.5-flash/sales_catalogue_1.json
+  claude-sonnet-4/sales_catalogue_1.json
+```
+
+…it loads one catalogue per model and produces a side-by-side comparison.
 
 ---
 
