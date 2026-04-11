@@ -383,7 +383,7 @@ _FINISH_CATALOGUE_TOOL = {
                         },
                         "granularity": {
                             "type": "string",
-                            "enum": ["daily", "weekly", "monthly", "quarterly", "annual", "event"],
+                            "enum": ["daily", "weekly", "monthly", "quarterly", "annual", "tick"],
                         },
                         "unit":        {"type": "string"},
                         "tables_used": {"type": "array", "items": {"type": "string"}},

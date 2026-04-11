@@ -33,7 +33,7 @@ class MeasurableMetric(BaseModel):
     time_range: TimeRange = Field(
         description="Earliest and latest date present in the query result"
     )
-    granularity: Literal["daily", "weekly", "monthly", "quarterly", "annual", "event"] = Field(
+    granularity: Literal["daily", "weekly", "monthly", "quarterly", "annual", "tick"] = Field(
         description="Natural time granularity of the data"
     )
     unit: str = Field(
