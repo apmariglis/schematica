@@ -99,18 +99,22 @@ def _tables_referenced_in_sql(sql: str) -> set[str]:
       - Double-quoted identifiers: FROM "Order Details"
       - Bracket-quoted:            FROM [Order Details]
       - Backtick-quoted:           FROM `order_details`
+      - Schema-qualified:          FROM public.orders     (returns "orders")
+      - Quoted schema+table:       FROM "public"."orders" (returns "orders")
     """
-    # Each alternative captures the table name into a different group;
-    # filter out empty strings and normalise to lowercase.
-    # next() uses None as default so subquery expressions (e.g. FROM (...) AS sub)
-    # that produce all-empty groups don't raise StopIteration / RuntimeError.
-    pattern = r'\b(?:FROM|JOIN)\s+(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|(\w+))'
-    matches = re.findall(pattern, sql, re.IGNORECASE)
-    return {
-        name.lower()
-        for groups in matches
-        if (name := next((g for g in groups if g), None)) is not None
-    }
+    # An identifier is any of: "...", `...`, [...], or bare word characters.
+    _IDENT = r'(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|\w+)'
+    # After FROM/JOIN: optionally consume a schema prefix (identifier + dot),
+    # then capture the table identifier in groups 1-4 below.
+    _TABLE = r'(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|(\w+))'
+    pattern = rf'\b(?:FROM|JOIN)\s+(?:{_IDENT}\s*\.\s*)?{_TABLE}'
+
+    tables: set[str] = set()
+    for groups in re.findall(pattern, sql, re.IGNORECASE):
+        table = next((g for g in groups if g), None)
+        if table:
+            tables.add(table.lower())
+    return tables
 
 
 def _tables_used_violations(items: list[dict]) -> list[str]:
