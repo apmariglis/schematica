@@ -150,6 +150,66 @@ All settings are prefixed `SC_` in your `.env` file:
 
 ---
 
+## Exploration budget
+
+The Phase 1 iteration budget scales with the number of tables in the database:
+
+```
+budget = min(SC_BUDGET_BASE + n_tables × SC_BUDGET_MULTIPLIER, SC_BUDGET_CAP)
+```
+
+With the defaults (`base=10`, `multiplier=3`, `cap=50`):
+
+| Tables | Budget |
+|--------|--------|
+| 1 | 13 |
+| 5 | 25 |
+| 10 | 40 |
+| 14+ | 50 (capped) |
+
+The agent must use at least half the budget before finishing Phase 1, so small databases still get a minimum of 5 exploratory queries.
+
+---
+
+## Phase 3 validation codes
+
+After Phase 2 the catalogue is validated against the live database. Issues are reported with short codes:
+
+| Code | Meaning | Action |
+|------|---------|--------|
+| `zero_rows` | SQL ran without error but returned 0 rows — filter condition may be wrong or data is absent | Sent to refinement agent |
+| `sparse` | Fewer than 3 rows returned — not enough data points for a reliable metric | Sent to refinement agent |
+| `high_nulls` | Value column has >10% NULL entries — may silently skew aggregations | Sent to refinement agent |
+| `extra_cols` | Query returns more than 2 columns — metrics must return exactly date + value | Sent to refinement agent |
+| `date_mismatch` | Actual data range falls outside the declared `time_range` | Auto-patched |
+| `period_boundary` | `time_range` start/end does not align to the granularity boundary (e.g. monthly → first of month) | Auto-patched |
+
+Auto-patched issues are corrected directly without an LLM call. Everything else is fed back to the refinement agent (Phase 3), which uses `run_query` to investigate and resubmits a corrected catalogue.
+
+---
+
+## Troubleshooting
+
+**`litellm` not found**
+Run `uv sync --extra litellm`. The base install only includes the Anthropic SDK.
+
+**`API key not set` / `401 Unauthorized`**
+Check that the correct key is set in `.env` for your provider (see the table in Getting started, step 2).
+
+**`OperationalError: unable to open database file`**
+The path passed to `--db` does not exist. Check the path and working directory.
+
+**`OperationalError: attempt to write a readonly database`**
+Schematica opens SQLite in read-only mode (`mode=ro`). If you see this for a non-SQLite database, the connected user has write access — connect with a read-only user.
+
+**Empty or very sparse catalogue**
+The database may have no date/time columns. Schematica can only produce time-series metrics when a date dimension is present. Queryable facts (static lookup tables, snapshots) will still be catalogued.
+
+**Phase 3 refinement loop hits budget**
+Increase `SC_REFINEMENT_BUDGET` in `.env`. The default is 15 iterations. Complex schemas with many SQL issues may need more.
+
+---
+
 ## Supported databases
 
 Any database supported by SQLAlchemy: SQLite, PostgreSQL, MySQL, MSSQL, and others.
