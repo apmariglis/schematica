@@ -392,6 +392,57 @@ def test_evaluate_fact_warns_for_zero_rows(engine):
 
 # ── evaluate_metric — null date column ────────────────────────────────────────
 
+def test_n_rows_reflects_non_null_value_rows_only():
+    # When some value rows are non-numeric (become NaN after coercion), n_rows
+    # should count only the rows with valid numeric values — matching what
+    # broker.fetch() returns after dropna.
+    eng = create_engine("sqlite:///:memory:")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (dt TEXT, val TEXT)"))
+        conn.execute(text("""
+            INSERT INTO t VALUES
+                ('2024-01-01', '1.0'),
+                ('2024-02-01', 'N/A'),
+                ('2024-03-01', '3.0')
+        """))
+    metric = {
+        "name": "mixed_values", "confidence": "high", "granularity": "monthly",
+        "unit": "units", "time_range": {},
+        "sql": "SELECT dt, val FROM t ORDER BY dt",
+    }
+
+    result = evaluate_metric(eng, metric)
+
+    # Only 2 rows have valid numeric values — n_rows must reflect this
+    assert result.n_rows == 2
+
+
+def test_date_range_reflects_non_null_value_rows_only():
+    # When the first or last rows have non-numeric values, actual_start/end
+    # must be derived from the non-null subset — matching broker.fetch() output.
+    eng = create_engine("sqlite:///:memory:")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (dt TEXT, val TEXT)"))
+        conn.execute(text("""
+            INSERT INTO t VALUES
+                ('2024-01-01', 'N/A'),
+                ('2024-02-01', '2.0'),
+                ('2024-03-01', '3.0'),
+                ('2024-04-01', 'N/A')
+        """))
+    metric = {
+        "name": "edge_nulls", "confidence": "high", "granularity": "monthly",
+        "unit": "units", "time_range": {},
+        "sql": "SELECT dt, val FROM t ORDER BY dt",
+    }
+
+    result = evaluate_metric(eng, metric)
+
+    # actual_start/end should be the bounds of the non-null data
+    assert result.actual_start == "2024-02-01"
+    assert result.actual_end   == "2024-03-01"
+
+
 def test_evaluate_metric_does_not_store_the_string_none_when_date_column_is_null():
     # A query that returns NULL in the date column must not record "None" as the
     # actual_start/end — that string would corrupt the date range comparison.

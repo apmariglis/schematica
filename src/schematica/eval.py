@@ -117,13 +117,22 @@ def evaluate_metric(engine, metric: dict) -> MetricResult:
     df = df.rename(columns={df.columns[0]: "_date", df.columns[1]: "_value"})
     df["_value"] = pd.to_numeric(df["_value"], errors="coerce")
 
-    result.null_rate  = df["_value"].isna().mean()
-    result.value_min  = float(df["_value"].min()) if not df["_value"].isna().all() else None
-    result.value_max  = float(df["_value"].max()) if not df["_value"].isna().all() else None
+    # null_rate is computed over the full result set (including coercion failures)
+    result.null_rate = df["_value"].isna().mean()
+
+    # All remaining statistics are derived from non-null rows only, so they
+    # match what broker.fetch() returns after its own dropna call.
+    df_valid = df.dropna(subset=["_value"])
+    result.n_rows    = len(df_valid)
+    result.value_min = float(df_valid["_value"].min()) if len(df_valid) else None
+    result.value_max = float(df_valid["_value"].max()) if len(df_valid) else None
     # Guard against all-NULL date columns: str(None) produces "None", which
     # would corrupt the date range comparison downstream.
-    _start_raw = df["_date"].iloc[0]
-    _end_raw   = df["_date"].iloc[-1]
+    if len(df_valid):
+        _start_raw = df_valid["_date"].iloc[0]
+        _end_raw   = df_valid["_date"].iloc[-1]
+    else:
+        _start_raw = _end_raw = None
     result.actual_start = str(_start_raw)[:10] if _start_raw is not None else ""
     result.actual_end   = str(_end_raw)[:10]   if _end_raw   is not None else ""
 
