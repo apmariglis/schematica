@@ -214,6 +214,9 @@ The database may have no date/time columns. Schematica can only produce time-ser
 **Phase 3 refinement loop hits budget**
 Increase `SC_REFINEMENT_BUDGET` in `.env`. The default is 15 iterations. Complex schemas with many SQL issues may need more.
 
+**`No output file written` — agent exhausted retries**
+The agent hit the output token limit while writing `finish_catalogue`, which truncates the JSON mid-response. The agent is asked to resubmit a smaller catalogue (target 3–5 metrics per table, ~70 total). If this keeps failing, increase `SC_MAX_OUTPUT_TOKENS` in `.env` (default 32768) or reduce the exploration budget so the agent proposes fewer metrics.
+
 ---
 
 ## Supported databases
