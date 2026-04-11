@@ -461,6 +461,8 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
             console.print(f"[bold red]Error:[/bold red] SQLite database not found: {db_file}")
             raise SystemExit(1)
 
+    _probe_connection(make_readonly_engine(connection_string), connection_string)
+
     console.print("[dim]Introspecting schema…[/dim]")
     snapshot = introspect(connection_string)
     schema_text = render_as_text(snapshot)
@@ -928,6 +930,28 @@ def _decode_sql_error(exc: Exception) -> str:
             msg = msg[idx:]
             break
     return msg.split("\n")[0][:200]
+
+
+def _probe_connection(engine, connection_string: str) -> None:
+    """Verify the database is reachable before spending tokens on introspection.
+
+    SQLite is exempt — its file-existence check runs earlier in run().
+    For all other dialects, attempt a trivial connection and raise SystemExit
+    with a clear message if it fails.
+    """
+    if connection_string.startswith("sqlite"):
+        return
+    try:
+        with engine.connect():
+            pass
+    except Exception as exc:
+        console.print(
+            f"[bold red]Error:[/bold red] Cannot connect to database: {exc}\n"
+            f"  Connection string: {connection_string}\n"
+            "  Check that the database is running, the credentials are correct, "
+            "and the host is reachable."
+        )
+        raise SystemExit(1)
 
 
 def _select_phase3_result(
