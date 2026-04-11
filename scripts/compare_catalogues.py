@@ -108,9 +108,9 @@ def _expand_db_sources(sources: list[str]) -> list[str]:
     for src in sources:
         p = Path(src)
         if p.is_dir():
-            db_files = sorted(p.glob("*.db"))
+            db_files = sorted(p.glob("*.db")) + sorted(p.glob("*.sqlite"))
             if not db_files:
-                console.print(f"[yellow]No .db files found in directory: {src}[/yellow]")
+                console.print(f"[yellow]No .db or .sqlite files found in directory: {src}[/yellow]")
             result.extend(str(f) for f in db_files)
         else:
             result.append(src)
