@@ -19,6 +19,8 @@ The agent compiles everything it learned into a structured catalogue with descri
 **Phase 3 — Validation**
 Every metric and fact is executed against the full database. Issues like wrong shape, zero rows, high nulls, date mismatches, duplicate SQL, and constant values are detected. Many are auto-patched; the rest are sent back to the agent for correction or removed with a note.
 
+Schematica is **read-only** — it never modifies your database. All connections are opened in read-only mode and only `SELECT` queries are permitted.
+
 ---
 
 ## Getting started
