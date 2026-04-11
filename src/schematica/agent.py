@@ -34,7 +34,7 @@ from rich.panel import Panel
 from rich.text import Text
 from sqlalchemy import text
 
-from schematica.db import make_engine
+from schematica.db import make_readonly_engine
 
 from schematica.catalogue import DataCatalogue
 from schematica.eval import evaluate_metric, evaluate_fact
@@ -469,7 +469,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
         for t in snapshot["tables"]
     }
 
-    engine = make_engine(connection_string)
+    engine = make_readonly_engine(connection_string)
     n_tables = len(snapshot["tables"])
     budget = _phase1_budget(n_tables)
     min_iter = max(_MIN_ITER_FLOOR, budget // _MIN_ITER_DIVISOR)
