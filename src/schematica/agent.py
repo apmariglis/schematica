@@ -1351,11 +1351,14 @@ def _get_anthropic_client():
 # ── rich output helpers ────────────────────────────────────────────────────────
 
 def _print_header(connection_string: str, out_path: str) -> None:
+    model_line = MODEL
+    if MODEL.startswith("anthropic/"):
+        model_line += "  [dim](cache: on)[/dim]" if _CACHE else "  [dim](cache: off — set SC_CACHE=true to enable)[/dim]"
     console.print(Panel(
         f"[bold]Schematica[/bold]\n"
         f"[dim]Source:[/dim]  {connection_string}\n"
         f"[dim]Output:[/dim]  {out_path}\n"
-        f"[dim]Model:[/dim]   {MODEL}",
+        f"[dim]Model:[/dim]   {model_line}",
         border_style="cyan",
         padding=(0, 1),
     ))
