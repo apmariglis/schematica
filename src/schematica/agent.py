@@ -139,6 +139,42 @@ def _tables_used_violations(items: list[dict]) -> list[str]:
     return violations
 
 
+def _uncovered_fk_pairs(
+    metrics: list[dict],
+    fk_pairs: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """
+    Return FK pairs that have no covering metric.
+
+    A FK pair (table_a, table_b) is considered covered when at least one metric's
+    SQL references both tables in its FROM/JOIN clauses.  Direction is ignored:
+    (orders, customers) is covered whether the SQL says FROM orders JOIN customers
+    or FROM customers JOIN orders.
+
+    Parameters
+    ----------
+    metrics : list[dict]
+        Submitted measurable_metrics (facts are excluded — they don't count).
+    fk_pairs : list[tuple[str, str]]
+        Each tuple is (from_table, to_table) as returned by the schema snapshot.
+    """
+    if not fk_pairs:
+        return []
+
+    # Build a set of frozensets so direction doesn't matter for lookup
+    uncovered = []
+    for from_table, to_table in fk_pairs:
+        pair = frozenset({from_table.lower(), to_table.lower()})
+        covered = any(
+            pair <= _tables_referenced_in_sql(m.get("sql", ""))
+            for m in metrics
+            if isinstance(m, dict)
+        )
+        if not covered:
+            uncovered.append((from_table.lower(), to_table.lower()))
+    return uncovered
+
+
 def _phase1_budget(n_tables: int) -> int:
     """Exploration iteration budget, scales with database size."""
     return min(_BUDGET_BASE + n_tables * _BUDGET_MULTIPLIER, _BUDGET_CAP)
@@ -478,6 +514,14 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
         for t in snapshot["tables"]
     }
 
+    # Collect all FK pairs so _agent_loop can validate that the catalogue
+    # contains at least one cross-table metric per FK relationship.
+    fk_pairs: list[tuple[str, str]] = [
+        (t["name"], fk["to_table"])
+        for t in snapshot["tables"]
+        for fk in t.get("foreign_keys", [])
+    ]
+
     engine = make_readonly_engine(connection_string)
     n_tables = len(snapshot["tables"])
     budget = _phase1_budget(n_tables)
@@ -487,7 +531,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
     usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation_tokens": 0, "cache_read_tokens": 0}
     started_at = time.monotonic()
     try:
-        catalogue_data = _agent_loop(schema_text, engine, budget, min_iter, usage, table_columns)
+        catalogue_data = _agent_loop(schema_text, engine, budget, min_iter, usage, table_columns, fk_pairs)
     except Exception as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         catalogue_data = None
@@ -557,7 +601,7 @@ def _make_backend(initial_user_text: str, system_prompt: str) -> "_AnthropicBack
 
 # ── agent loop ─────────────────────────────────────────────────────────────────
 
-def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: int, usage: dict, table_columns: dict) -> dict:
+def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: int, usage: dict, table_columns: dict, fk_pairs: list[tuple[str, str]] | None = None) -> dict:
     initial_message = (
         f"Here is the complete schema snapshot of the database:\n\n"
         f"```\n{schema_text}\n```\n\n"
@@ -763,6 +807,19 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
                         "tables_used mismatch — tables_used must list only tables that appear "
                         "in the SQL FROM/JOIN clauses:\n  " + "\n  ".join(tables_used_errors)
                     )
+                # FK coverage: every FK relationship must have at least one metric
+                # whose SQL JOINs both tables.
+                if fk_pairs:
+                    submitted_metrics = [m for m in block.input.get("measurable_metrics", []) if isinstance(m, dict)]
+                    missing_fks = _uncovered_fk_pairs(submitted_metrics, fk_pairs)
+                    if missing_fks:
+                        pairs_str = ", ".join(f"{a}↔{b}" for a, b in missing_fks)
+                        rejection_reasons.append(
+                            f"Missing cross-table metrics for FK relationships: {pairs_str}. "
+                            "Each FK relationship requires at least one measurable_metric whose "
+                            "SQL JOINs both tables and returns (period, aggregate_value). "
+                            "A queryable_fact with a JOIN does not satisfy this requirement."
+                        )
                 # Pre-validate metrics and facts against the Pydantic schema so
                 # validation errors are returned to the agent rather than crashing.
                 if not rejection_reasons:
