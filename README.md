@@ -39,7 +39,8 @@ Copy `.env.example` to `.env` and set the API key for your provider:
 | Provider | Key | Model prefix |
 |---|---|---|
 | Gemini | `GOOGLE_API_KEY` | `gemini/gemini-2.5-flash` |
-| Anthropic | `ANTHROPIC_API_KEY` | `anthropic/claude-sonnet-4-20250514` |
+| Anthropic (Sonnet) | `ANTHROPIC_API_KEY` | `anthropic/claude-sonnet-4-6` |
+| Anthropic (Opus) | `ANTHROPIC_API_KEY` | `anthropic/claude-opus-4-6` |
 
 Set `SC_MODEL` in `.env` to your chosen model. Gemini is the default — it performs well and is cheap to run.
 
@@ -115,7 +116,7 @@ uv run python scripts/compare_catalogues.py \
       "description": "Total revenue per month",
       "sql": "SELECT DATE_TRUNC(created_at, MONTH), SUM(amount) FROM orders GROUP BY 1",
       "time_range": {"start": "2022-01-01", "end": "2024-12-31"},
-      "granularity": "monthly",   // daily | weekly | monthly | quarterly | annual | tick
+      "granularity": "monthly",   // daily | weekly | monthly | quarterly | annual | tick (un-aggregated, one row per raw event)
       "unit": "€",
       "tables_used": ["orders"],
       "confidence": "high",
@@ -187,6 +188,8 @@ After Phase 2 the catalogue is validated against the live database. Issues are r
 | `sparse` | Fewer than 3 rows returned — not enough data points for a reliable metric | Sent to refinement agent |
 | `high_nulls` | Value column has >10% NULL entries — may silently skew aggregations | Sent to refinement agent |
 | `extra_cols` | Query returns more than 2 columns — metrics must return exactly date + value | Sent to refinement agent |
+| `constant_values` | All non-null rows have the same value — the metric carries no trend information | Sent to refinement agent |
+| `non_date_col` | First column (date column) cannot be parsed as dates in >5% of rows | Sent to refinement agent |
 | `date_mismatch` | Actual data range falls outside the declared `time_range` | Auto-patched |
 | `period_boundary` | `time_range` start/end does not align to the granularity boundary (e.g. monthly → first of month) | Auto-patched |
 
@@ -207,6 +210,9 @@ The path passed to `--db` / `--dbs` does not exist. Check the path and working d
 
 **`OperationalError: attempt to write a readonly database`**
 Schematica opens SQLite in read-only mode (`mode=ro`). If you see this for a non-SQLite database, the connected user has write access — connect with a read-only user.
+
+**`UserWarning: Fuzzy match: '...' resolved to '...'`**
+`broker.fetch()` applies fuzzy name matching. The warning means the name you passed was close but not exact — use the resolved name shown in the warning (or the exact name from `broker.list_metrics()`) to suppress it.
 
 **Empty or very sparse catalogue**
 The database may have no date/time columns. Schematica can only produce time-series metrics when a date dimension is present. Queryable facts (static lookup tables, snapshots) will still be catalogued.
