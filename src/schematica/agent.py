@@ -626,6 +626,7 @@ def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: i
         phase_label="1 (exploration)",
         usage=usage,
         table_columns=table_columns,
+        fk_pairs=fk_pairs,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -664,6 +665,7 @@ def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: i
         phase_label="2 (documentation)",
         usage=usage,
         table_columns=table_columns,
+        fk_pairs=fk_pairs,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -671,7 +673,7 @@ def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: i
     raise RuntimeError("Agent did not produce a catalogue after both phases.")
 
 
-def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, usage: dict, table_columns: dict, min_iter: int = 0) -> tuple[dict | None, list]:
+def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, usage: dict, table_columns: dict, min_iter: int = 0, fk_pairs: list[tuple[str, str]] | None = None) -> tuple[dict | None, list]:
     """Run one phase of the agent loop. Returns (catalogue_data, last_rejection_reasons)."""
     last_rejection_reasons: list[str] = []
     for i in range(1, max_iter + 1):
