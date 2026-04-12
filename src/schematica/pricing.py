@@ -39,10 +39,13 @@ def _with_cache(input: float, output: float) -> dict:
 
 
 _HARDCODED_FALLBACK: dict[str, dict] = {
-    "claude-sonnet-4-20250514":  _with_cache(3.00,  15.00),
-    "claude-sonnet-4-6":         _with_cache(3.00,  15.00),
-    "claude-haiku-4-5-20251001": _with_cache(0.80,   4.00),
-    "claude-haiku-3-20240307":   _with_cache(0.25,   1.25),
+    # Prices in USD per million tokens — last verified 2025-05
+    # Live fetch from LiteLLM supersedes these values at runtime.
+    "claude-opus-4-6":           _with_cache(15.00,  75.00),
+    "claude-sonnet-4-20250514":  _with_cache( 3.00,  15.00),
+    "claude-sonnet-4-6":         _with_cache( 3.00,  15.00),
+    "claude-haiku-4-5-20251001": _with_cache( 0.80,   4.00),
+    "claude-haiku-3-20240307":   _with_cache( 0.25,   1.25),
 }
 
 
@@ -120,7 +123,16 @@ def get_model_pricing(model_id: str, pricing: dict | None = None) -> dict:
     for key in table:
         if key.startswith(model_id):
             return table[key]
-    return _HARDCODED_FALLBACK.get(model_id, {"input": 3.00, "output": 15.00})
+    if model_id in _HARDCODED_FALLBACK:
+        return _HARDCODED_FALLBACK[model_id]
+    warnings.warn(
+        f"No pricing data found for model {model_id!r} — cost estimate will be inaccurate. "
+        "Add the model to _HARDCODED_FALLBACK in pricing.py or ensure a live/cached pricing "
+        "table is available.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30}
 
 
 MODEL_PRICING, PRICING_SOURCE = build_pricing_table()
