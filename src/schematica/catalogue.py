@@ -57,10 +57,10 @@ class MeasurableMetric(BaseModel):
         description="Reasoning behind column choices, any assumptions made, or data quality caveats"
     )
 
-    @field_validator("sql", mode="before")
+    @field_validator("sql")
     @classmethod
     def strip_trailing_semicolon(cls, v: str) -> str:
-        return v.strip().rstrip(";").strip() if isinstance(v, str) else v
+        return v.strip().rstrip(";").strip()
 
 
 class QueryableFact(BaseModel):
@@ -85,10 +85,10 @@ class QueryableFact(BaseModel):
         description="How this fact was identified, any caveats, or freshness notes"
     )
 
-    @field_validator("sql", mode="before")
+    @field_validator("sql")
     @classmethod
     def strip_trailing_semicolon(cls, v: str) -> str:
-        return v.strip().rstrip(";").strip() if isinstance(v, str) else v
+        return v.strip().rstrip(";").strip()
 
 
 class TableSummary(BaseModel):
