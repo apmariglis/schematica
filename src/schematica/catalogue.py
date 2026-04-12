@@ -34,7 +34,11 @@ class MeasurableMetric(BaseModel):
         description="Earliest and latest date present in the query result"
     )
     granularity: Literal["daily", "weekly", "monthly", "quarterly", "annual", "tick"] = Field(
-        description="Natural time granularity of the data"
+        description=(
+            "Natural time granularity of the data. "
+            "Use 'tick' for un-aggregated metrics where each row represents a single raw "
+            "event or record (no GROUP BY period); all other values denote periodic aggregates."
+        )
     )
     unit: str = Field(
         description="Unit of the value column, e.g. count, €, hours, %, kW, ratio"

@@ -240,7 +240,9 @@ General rules:
 - time_range start and end must align to the metric's granularity boundary: \
   for monthly metrics both dates must be the first day of a month; for annual \
   metrics the first day of a year. Use the snapshot column min/max and truncate \
-  to the nearest period boundary — never use a mid-period date as a range endpoint.
+  to the nearest period boundary — never use a mid-period date as a range endpoint. \
+  For "tick" granularity (un-aggregated, one row per raw event/record) any ISO date \
+  is acceptable — there is no period boundary to align to.
 - When two metrics measure a similar concept from different source tables, \
   document in agent_notes how they differ and when to prefer each.
 - For every quantifiable entity, consider both forms: a flow metric (how many \
