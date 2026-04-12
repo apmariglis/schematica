@@ -970,12 +970,12 @@ def _build_catalogue(data: dict, snapshot: dict) -> DataCatalogue:
             model=MODEL,
             connection=snapshot["connection_string"],
             dialect=snapshot["dialect"],
-            description=data.get("description", ""),
+            description=data.get("description") or "",
             tables=data["tables"],
             measurable_metrics=data["measurable_metrics"],
-            queryable_facts=data.get("queryable_facts", []),
+            queryable_facts=data.get("queryable_facts") or [],
             time_coverage=data["time_coverage"],
-            data_quality_notes=data.get("data_quality_notes", []),
+            data_quality_notes=data.get("data_quality_notes") or [],
         )
     except Exception as exc:
         console.print(f"[red]Catalogue validation error: {exc}[/red]")
