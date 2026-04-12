@@ -37,13 +37,17 @@ class _AnthropicBackend:
         self.messages = messages  # shared, mutated in-place
 
     def call(self, tools: list, max_tokens: int):
-        return self._client.messages.create(
+        # Streaming is required for requests that may take longer than 10 minutes.
+        # get_final_message() returns a Message object with the same interface as
+        # the non-streaming create() response, so no other code needs to change.
+        with self._client.messages.stream(
             model=self._model,
             max_tokens=max_tokens,
             system=[{"type": "text", "text": self._system, "cache_control": {"type": "ephemeral"}}],
             messages=self.messages,
             tools=tools,
-        )
+        ) as stream:
+            return stream.get_final_message()
 
     def extract_usage(self, response) -> dict:
         u = response.usage

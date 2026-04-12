@@ -117,14 +117,18 @@ def build_pricing_table(
 
 
 def get_model_pricing(model_id: str, pricing: dict | None = None) -> dict:
+    # Strip provider prefix (e.g. "anthropic/claude-x" → "claude-x") so lookups
+    # work regardless of whether the caller passes a prefixed or bare model name.
+    bare_id = model_id.split("/", 1)[1] if "/" in model_id else model_id
     table = pricing if pricing is not None else MODEL_PRICING
-    if model_id in table:
-        return table[model_id]
-    for key in table:
-        if key.startswith(model_id):
-            return table[key]
-    if model_id in _HARDCODED_FALLBACK:
-        return _HARDCODED_FALLBACK[model_id]
+    for lookup in (model_id, bare_id):
+        if lookup in table:
+            return table[lookup]
+        for key in table:
+            if key.startswith(lookup):
+                return table[key]
+    if bare_id in _HARDCODED_FALLBACK:
+        return _HARDCODED_FALLBACK[bare_id]
     warnings.warn(
         f"No pricing data found for model {model_id!r} — cost estimate will be inaccurate. "
         "Add the model to _HARDCODED_FALLBACK in pricing.py or ensure a live/cached pricing "
