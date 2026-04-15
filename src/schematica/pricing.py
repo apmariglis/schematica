@@ -46,9 +46,6 @@ _HARDCODED_FALLBACK: dict[str, dict] = {
     "claude-sonnet-4-6":         _with_cache( 3.00,  15.00),
     "claude-haiku-4-5-20251001": _with_cache( 0.80,   4.00),
     "claude-haiku-3-20240307":   _with_cache( 0.25,   1.25),
-    # Together AI — not always present in LiteLLM's live data
-    "meta-llama/Llama-3.1-405B-Instruct-Turbo": {"input": 3.50, "output": 3.50},
-    "meta-llama/Llama-3.3-70B-Instruct-Turbo":  {"input": 0.88, "output": 0.88},
 }
 
 
@@ -205,12 +202,6 @@ _CONTEXT_WINDOW_FALLBACK: dict[str, int] = {
     "claude-3-5-sonnet-20241022":            200_000,
     "claude-3-5-haiku-20241022":             200_000,
     "claude-3-7-sonnet-20250219":            200_000,
-    # Together AI — stored in LiteLLM JSON but max_input_tokens is null
-    "together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo":        131_072,
-    "together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo-Free":   131_072,
-    "together_ai/meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo":    131_072,
-    "together_ai/meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo":   131_072,
-    "together_ai/meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo":  131_072,
 }
 
 CONTEXT_WINDOWS: dict[str, int] = build_context_window_table()

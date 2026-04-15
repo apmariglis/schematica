@@ -63,7 +63,6 @@ Use `--model` to override `SC_MODEL` from `.env` for a single run — useful for
 
 ```bash
 uv run schematica --db path/to/mydb.db --model gpt-4o
-uv run schematica --db path/to/mydb.db --model together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo
 ```
 
 **4. Evaluate the catalogue**

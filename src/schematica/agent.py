@@ -2479,7 +2479,7 @@ def main() -> None:
     parser.add_argument("--skip-ro-check", action="store_true",
                         help="Skip the read-only user confirmation prompt (for CI / automated use)")
     parser.add_argument("--model", default=None, metavar="MODEL",
-                        help="Override SC_MODEL from .env (e.g. gpt-4o, together_ai/meta-llama/...)")
+                        help="Override SC_MODEL from .env (e.g. gpt-4o, gemini/gemini-2.5-flash)")
     parser.add_argument("--cache", action="store_true", default=False,
                         help="Enable prompt caching (anthropic/ models only). Overrides SC_CACHE=false.")
     args = parser.parse_args()

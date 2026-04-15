@@ -4,7 +4,7 @@ Tests for get_context_window — look up max input tokens for a model.
 Three-tier resolution (same pattern as pricing):
   1. Data extracted from LiteLLM's JSON during the live/cached fetch
   2. Static fallback table for models that are missing or have null values
-     in LiteLLM's JSON (e.g. Together AI Llama models)
+     in LiteLLM's JSON (e.g. Anthropic models dropped from the plain-key map)
   3. Returns 0 for completely unknown models (callers treat 0 as "don't show")
 """
 from __future__ import annotations
@@ -27,11 +27,6 @@ def test_gpt4o_returns_128k():
 
 
 # ── static fallback for models with null/missing data in LiteLLM ──────────────
-
-def test_together_ai_llama_3_3_70b_returns_131072():
-    model = "together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo"
-    assert get_context_window(model) == 131_072
-
 
 def test_anthropic_prefixed_claude_3_5_sonnet_returns_200k():
     assert get_context_window("anthropic/claude-3-5-sonnet-20241022") == 200_000

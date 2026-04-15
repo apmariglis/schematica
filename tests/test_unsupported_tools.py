@@ -15,8 +15,8 @@ from schematica.agent import _call_with_retry
 
 
 _UNSUPPORTED_TOOLS_MSG = (
-    "together_ai does not support parameters: ['tools'], "
-    "for model=meta-llama/Llama-3.1-405B-Instruct-Turbo. "
+    "some-provider does not support parameters: ['tools'], "
+    "for model=some-vendor/some-model. "
     "To drop these, set `litellm.drop_params=True`"
 )
 

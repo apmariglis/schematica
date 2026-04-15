@@ -40,9 +40,9 @@ def test_gemini_override_sets_cache_false(monkeypatch):
     assert agent_module._CACHE is False
 
 
-def test_together_ai_override_sets_cache_false(monkeypatch):
+def test_non_anthropic_provider_override_sets_cache_false(monkeypatch):
     _setup(monkeypatch)
-    _override("together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo")
+    _override("gemini/gemini-2.5-flash")
     assert agent_module._CACHE is False
 
 
