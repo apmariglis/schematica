@@ -59,6 +59,13 @@ uv run schematica --db oracle+cx_oracle://user:pw@host/sid # Oracle
 
 Any database supported by SQLAlchemy works. Output is written to `<db_dir>/<model>/<db_stem>_catalogue_<n>.json`. For example, running against `data/sales.db` with `gemini-2.5-flash` produces `data/gemini-2.5-flash/sales_catalogue_1.json`. Each run gets an auto-incremented index so repeated runs never overwrite each other.
 
+Use `--model` to override `SC_MODEL` from `.env` for a single run — useful for comparing models without editing config:
+
+```bash
+uv run schematica --db path/to/mydb.db --model gpt-4o
+uv run schematica --db path/to/mydb.db --model together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo
+```
+
 **4. Evaluate the catalogue**
 
 ```bash
@@ -99,6 +106,29 @@ uv run python scripts/compare_catalogues.py \
 ```
 
 `--dbs` accepts file paths (`.db`, `.sqlite`), SQLAlchemy connection strings, or a directory (expanded to all `.db` and `.sqlite` files inside it). `--catalogues` accepts a directory (catalogues found directly inside it and in its immediate subfolders are included) or an explicit list of JSON files. Each catalogue is matched to its database via the `connection` field stored inside the catalogue JSON — so mixing databases and scattered files all works. The model label is taken from the catalogue file's parent directory name.
+
+---
+
+## Progress display
+
+While running, schematica prints a live stats box after each iteration:
+
+```
+  Phase 1 (exploration) — iteration 4/31…
+  [tool calls, query results…]
+  ╭─ current iter 4/31 ─────────────────────────────────────────────╮
+  │  7,104 in · 201 out · $0.0026 · 1.7s · 3.6% ctx                │
+  ├─ accumulated ───────────────────────────────────────────────────┤
+  │  28,419 in · 804 out · $0.0104 · 18.5s · 13.0 iter/min         │
+  ╰─ each iteration = 1 LLM call ──────────────────────────────────╯
+  Phase 1 (exploration) — iteration 5/31…
+```
+
+**current iter** — tokens sent/received, cost, and wall-clock time for that single LLM call, plus how full the context window is (`% ctx`).
+
+**accumulated** — session totals: tokens, cost, elapsed time, and average throughput in iterations per minute.
+
+Context window fill (`% ctx`) is shown when the model is recognised. It is derived from the input token count, which equals the full conversation history sent on each call.
 
 ---
 
