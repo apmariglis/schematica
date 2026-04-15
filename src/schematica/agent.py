@@ -1034,8 +1034,13 @@ def _call_with_retry(backend, tools: list, max_tokens: int = _MAX_OUTPUT_TOKENS,
 
     Uses the retry-after header hint from the exception when available (exact
     wait the API requested).  Falls back to exponential backoff otherwise.
+
+    Empty-choices responses (API content-policy refusal) are handled separately:
+    one nudge message is appended and the call is retried once without sleeping.
+    A second consecutive empty-choices raises immediately.
     """
-    delay = 30
+    delay = 65  # starting own-backoff; 65s clears a 60s rate-limit window on first retry
+    empty_choices_count = 0
     for attempt in range(1, max_attempts + 1):
         try:
             return backend.call(tools, max_tokens)
@@ -1052,8 +1057,28 @@ def _call_with_retry(backend, tools: list, max_tokens: int = _MAX_OUTPUT_TOKENS,
                     "Choose a model with function/tool calling support "
                     "(e.g. gemini/gemini-2.5-flash, anthropic/claude-sonnet-4-6)."
                 ) from exc
+            is_empty_choices = "empty choices" in msg
+            if is_empty_choices:
+                empty_choices_count += 1
+                if empty_choices_count >= 2:
+                    raise RuntimeError(
+                        "Model returned an empty response twice in a row "
+                        "(empty choices — API content-policy filter). "
+                        "The conversation context may have triggered a safety filter. "
+                        "Try a different model or database."
+                    ) from exc
+                console.print(
+                    "[yellow]  Empty response from API (possible content filter) — "
+                    "nudging and retrying[/yellow]"
+                )
+                backend.append_user(
+                    "Your previous response was empty — the API returned no content. "
+                    "Please continue: call run_query to explore the database further, "
+                    "or call finish_catalogue if you have enough data."
+                )
+                continue  # retry immediately, no sleep
             is_rate_limit = "rate limit" in msg or "ratelimit" in msg or "429" in msg or "rate_limited" in msg
-            is_transient = "empty choices" in msg or "overloaded" in msg or "503" in msg or "502" in msg
+            is_transient = "overloaded" in msg or "503" in msg or "502" in msg
             if not (is_rate_limit or is_transient) or attempt == max_attempts:
                 raise
             hint = _retry_after_seconds(exc)
