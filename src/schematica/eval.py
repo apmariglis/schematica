@@ -76,6 +76,16 @@ class FactResult:
         self.status = "FAIL"
 
 
+def _is_evaluator_crash(result: "MetricResult | FactResult") -> bool:
+    """Return True when the SQL ran fine but the analysis framework crashed.
+
+    Detected by: sql_ok=True AND error starts with "eval error:".
+    These failures are caused by numpy/pandas version incompatibilities (e.g.
+    'No module named numpy.rec') and cannot be fixed by the refinement agent.
+    """
+    return bool(result.sql_ok and (result.error or "").startswith("eval error:"))
+
+
 def evaluate_metric(engine, metric: dict) -> MetricResult:
     result = MetricResult(
         name           = metric["name"],
@@ -91,7 +101,8 @@ def evaluate_metric(engine, metric: dict) -> MetricResult:
         result.error = "No SQL in catalogue entry"
         return result
 
-    # Run the query
+    # Run the query.  Separate try/except so SQL errors are distinguishable
+    # from analysis errors below.
     try:
         with engine.connect() as conn:
             df = pd.read_sql(text(sql), conn)
@@ -99,98 +110,105 @@ def evaluate_metric(engine, metric: dict) -> MetricResult:
         result.error = str(exc)
         return result
 
-    result.sql_ok    = True
-    result.n_cols    = len(df.columns)
-    result.col_names = list(df.columns)
-    result.n_rows    = len(df)
+    # Analyse the DataFrame.  Wrapped in its own try/except because numpy/pandas
+    # errors (e.g. version incompatibilities) can surface lazily here rather than
+    # during read_sql, and we want them captured as FAIL rather than crashing.
+    try:
+        result.sql_ok    = True
+        result.n_cols    = len(df.columns)
+        result.col_names = list(df.columns)
+        result.n_rows    = len(df)
 
-    if result.n_cols < 2:
-        result.error = f"Only {result.n_cols} column(s) returned; expected 2"
-        return result
+        if result.n_cols < 2:
+            result.error = f"Only {result.n_cols} column(s) returned; expected 2"
+            return result
 
-    if result.n_rows == 0:
-        result.error = "zero_rows"
-        result.status = "WARN"
-        return result
+        if result.n_rows == 0:
+            result.error  = "zero_rows"
+            result.status = "WARN"
+            return result
 
-    # Rename first two cols as date / value for analysis
-    df = df.rename(columns={df.columns[0]: "_date", df.columns[1]: "_value"})
-    df["_value"] = pd.to_numeric(df["_value"], errors="coerce")
+        # Rename first two cols as date / value for analysis
+        df = df.rename(columns={df.columns[0]: "_date", df.columns[1]: "_value"})
+        df["_value"] = pd.to_numeric(df["_value"], errors="coerce")
 
-    # null_rate is computed over the full result set (including coercion failures)
-    result.null_rate = df["_value"].isna().mean()
+        # null_rate is computed over the full result set (including coercion failures)
+        result.null_rate = df["_value"].isna().mean()
 
-    # All remaining statistics are derived from non-null rows only, so they
-    # match what broker.fetch() returns after its own dropna call.
-    df_valid = df.dropna(subset=["_value"])
-    result.n_rows    = len(df_valid)
-    result.value_min = float(df_valid["_value"].min()) if len(df_valid) else None
-    result.value_max = float(df_valid["_value"].max()) if len(df_valid) else None
-    # Guard against all-NULL date columns: str(None) produces "None", which
-    # would corrupt the date range comparison downstream.
-    if len(df_valid):
-        _start_raw = df_valid["_date"].iloc[0]
-        _end_raw   = df_valid["_date"].iloc[-1]
-    else:
-        _start_raw = _end_raw = None
-    result.actual_start = str(_start_raw)[:10] if _start_raw is not None else ""
-    result.actual_end   = str(_end_raw)[:10]   if _end_raw   is not None else ""
+        # All remaining statistics are derived from non-null rows only, so they
+        # match what broker.fetch() returns after its own dropna call.
+        df_valid = df.dropna(subset=["_value"])
+        result.n_rows    = len(df_valid)
+        result.value_min = float(df_valid["_value"].min()) if len(df_valid) else None
+        result.value_max = float(df_valid["_value"].max()) if len(df_valid) else None
+        # Guard against all-NULL date columns: str(None) produces "None", which
+        # would corrupt the date range comparison downstream.
+        if len(df_valid):
+            _start_raw = df_valid["_date"].iloc[0]
+            _end_raw   = df_valid["_date"].iloc[-1]
+        else:
+            _start_raw = _end_raw = None
+        result.actual_start = str(_start_raw)[:10] if _start_raw is not None else ""
+        result.actual_end   = str(_end_raw)[:10]   if _end_raw   is not None else ""
 
-    # Date column parseability: col 0 should be interpretable as dates.
-    # Small integers that pass pd.to_datetime (e.g. Unix timestamps near epoch)
-    # are caught by the range check — we only flag if coercion itself fails often.
-    parsed_dates = pd.to_datetime(df["_date"], errors="coerce", format="mixed")
-    nat_rate = float(parsed_dates.isna().mean())
-    result.date_col_ok = nat_rate <= WARN_DATE_PARSE_PCT
+        # Date column parseability: col 0 should be interpretable as dates.
+        # Small integers that pass pd.to_datetime (e.g. Unix timestamps near epoch)
+        # are caught by the range check — we only flag if coercion itself fails often.
+        parsed_dates = pd.to_datetime(df["_date"], errors="coerce", format="mixed")
+        nat_rate = float(parsed_dates.isna().mean())
+        result.date_col_ok = nat_rate <= WARN_DATE_PARSE_PCT
 
-    # Date range accuracy: actual should be within ±1 month of declared
-    declared_start_prefix = (result.declared_start or "")[:7]
-    declared_end_prefix   = (result.declared_end   or "")[:7]
-    actual_start_prefix   = result.actual_start[:7]
-    actual_end_prefix     = result.actual_end[:7]
+        # Date range accuracy: actual should be within ±1 month of declared
+        declared_start_prefix = (result.declared_start or "")[:7]
+        declared_end_prefix   = (result.declared_end   or "")[:7]
+        actual_start_prefix   = result.actual_start[:7]
+        actual_end_prefix     = result.actual_end[:7]
 
-    start_ok = (actual_start_prefix >= declared_start_prefix) if declared_start_prefix else True
-    end_ok   = (actual_end_prefix   <= declared_end_prefix)   if declared_end_prefix   else True
-    result.date_range_ok = start_ok and end_ok
+        start_ok = (actual_start_prefix >= declared_start_prefix) if declared_start_prefix else True
+        end_ok   = (actual_end_prefix   <= declared_end_prefix)   if declared_end_prefix   else True
+        result.date_range_ok = start_ok and end_ok
 
-    # Period boundary check: for periodic granularities the declared start/end
-    # should align to the period boundary (e.g. monthly → first day of month).
-    _BOUNDARY_SUFFIX = {
-        "monthly":   "-01",
-        "quarterly": "-01",
-        "annual":    "-01-01",
-    }
-    granularity = metric.get("granularity", "")
-    suffix = _BOUNDARY_SUFFIX.get(granularity)
-    if suffix:
-        start_aligned = not result.declared_start or result.declared_start.endswith(suffix)
-        end_aligned   = not result.declared_end   or result.declared_end.endswith(suffix)
-        result.period_boundary_ok = start_aligned and end_aligned
-    else:
-        result.period_boundary_ok = True
+        # Period boundary check: for periodic granularities the declared start/end
+        # should align to the period boundary (e.g. monthly → first day of month).
+        _BOUNDARY_SUFFIX = {
+            "monthly":   "-01",
+            "quarterly": "-01",
+            "annual":    "-01-01",
+        }
+        granularity = metric.get("granularity", "")
+        suffix = _BOUNDARY_SUFFIX.get(granularity)
+        if suffix:
+            start_aligned = not result.declared_start or result.declared_start.endswith(suffix)
+            end_aligned   = not result.declared_end   or result.declared_end.endswith(suffix)
+            result.period_boundary_ok = start_aligned and end_aligned
+        else:
+            result.period_boundary_ok = True
 
-    # Status
-    issues = []
-    if result.null_rate > WARN_NULL_RATE:
-        issues.append("high_nulls")
-    if result.n_rows < WARN_MIN_ROWS:
-        issues.append("sparse")
-    if not result.date_range_ok:
-        issues.append("date_mismatch")
-    if result.n_cols != 2:
-        issues.append("extra_cols")
-    if not result.period_boundary_ok:
-        issues.append("period_boundary")
-    if not result.date_col_ok:
-        issues.append("non_date_col")
-    # Constant-value: same value every period → useless as a trend metric
-    if (result.n_rows > 1
-            and result.value_min is not None
-            and result.value_min == result.value_max):
-        issues.append("constant_values")
+        # Status
+        issues = []
+        if result.null_rate > WARN_NULL_RATE:
+            issues.append("high_nulls")
+        if result.n_rows < WARN_MIN_ROWS:
+            issues.append("sparse")
+        if not result.date_range_ok:
+            issues.append("date_mismatch")
+        if result.n_cols != 2:
+            issues.append("extra_cols")
+        if not result.period_boundary_ok:
+            issues.append("period_boundary")
+        if not result.date_col_ok:
+            issues.append("non_date_col")
+        # Constant-value: same value every period → useless as a trend metric
+        if (result.n_rows > 1
+                and result.value_min is not None
+                and result.value_min == result.value_max):
+            issues.append("constant_values")
 
-    result.status = "WARN" if issues else "PASS"
-    result.error  = ", ".join(issues) if issues else ""
+        result.status = "WARN" if issues else "PASS"
+        result.error  = ", ".join(issues) if issues else ""
+    except Exception as exc:
+        result.error  = f"eval error: {exc}"
+        result.status = "FAIL"
 
     return result
 
@@ -210,20 +228,25 @@ def evaluate_fact(engine, fact: dict) -> FactResult:
         result.error = str(exc)
         return result
 
-    result.sql_ok = True
-    result.n_cols = len(df.columns)
-    result.n_rows = len(df)
+    try:
+        result.sql_ok = True
+        result.n_cols = len(df.columns)
+        result.n_rows = len(df)
 
-    if result.n_cols == 0:
-        result.error = "Query returned no columns"
-        return result
+        if result.n_cols == 0:
+            result.error = "Query returned no columns"
+            return result
 
-    if result.n_rows == 0:
-        result.error = "zero_rows"
-        result.status = "WARN"
-        return result
+        if result.n_rows == 0:
+            result.error  = "zero_rows"
+            result.status = "WARN"
+            return result
 
-    result.status = "PASS"
+        result.status = "PASS"
+    except Exception as exc:
+        result.error  = f"eval error: {exc}"
+        result.status = "FAIL"
+
     return result
 
 
