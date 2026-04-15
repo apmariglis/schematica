@@ -27,6 +27,16 @@ import json
 from types import SimpleNamespace
 
 
+def _try_int(val) -> int | None:
+    """Parse an integer from a header value string; return None on failure."""
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
 class _AnthropicBackend:
     """Anthropic-native backend. Maintains messages in Anthropic format."""
 
@@ -47,7 +57,20 @@ class _AnthropicBackend:
             messages=self.messages,
             tools=tools,
         ) as stream:
-            return stream.get_final_message()
+            msg = stream.get_final_message()
+            h = stream.response.headers
+            self._last_rl = {
+                "limit":     _try_int(h.get("anthropic-ratelimit-output-tokens-limit")),
+                "remaining": _try_int(h.get("anthropic-ratelimit-output-tokens-remaining")),
+            }
+            return msg
+
+    def last_output_rate_limit(self) -> dict:
+        """Return the output-token rate-limit headers from the most recent call.
+
+        Returns a dict with 'limit' and 'remaining' (both int or None).
+        """
+        return getattr(self, "_last_rl", {})
 
     def extract_usage(self, response) -> dict:
         u = response.usage
@@ -105,6 +128,24 @@ class _AnthropicBackend:
             if getattr(block, "type", None) == "tool_use" and isinstance(block.input, dict):
                 block.input = {"_truncated": True, "keys": list(block.input.keys())}
 
+    def compress_old_run_queries(self, keep_last: int = 2) -> None:
+        """Strip 'columns' and 'tables' from old run_query tool calls to reduce context size.
+
+        Keeps the last keep_last assistant messages (iterations) intact so the
+        model has full context on what it just did.
+        """
+        assistant_indices = [
+            i for i, m in enumerate(self.messages) if m.get("role") == "assistant"
+        ]
+        old_indices = assistant_indices[:-keep_last] if keep_last > 0 else assistant_indices
+        for i in old_indices:
+            for block in self.messages[i].get("content", []):
+                if (getattr(block, "type", None) == "tool_use"
+                        and getattr(block, "name", None) == "run_query"
+                        and isinstance(block.input, dict)):
+                    block.input.pop("columns", None)
+                    block.input.pop("tables", None)
+
 
 class _LiteLLMBackend:
     """LiteLLM backend. Maintains messages in OpenAI format."""
@@ -145,6 +186,10 @@ class _LiteLLMBackend:
                 "This usually means the response was filtered or the provider returned an error."
             )
         return response
+
+    def last_output_rate_limit(self) -> dict:
+        """No-op for LiteLLM — output TPM headers are not reliably available."""
+        return {}
 
     def extract_usage(self, response) -> dict:
         u = response.usage
@@ -236,3 +281,31 @@ class _LiteLLMBackend:
                 keys = []
             tc["function"]["arguments"] = json.dumps({"_truncated": True, "keys": keys})
         self.messages[-1]["content"] = ""
+
+    def compress_old_run_queries(self, keep_last: int = 2) -> None:
+        """Strip 'columns' and 'tables' from old run_query tool calls to reduce context size.
+
+        Keeps the last keep_last assistant messages (iterations) intact so the
+        model has full context on what it just did.
+        """
+        assistant_indices = [
+            i for i, m in enumerate(self.messages) if m.get("role") == "assistant"
+        ]
+        old_indices = assistant_indices[:-keep_last] if keep_last > 0 else assistant_indices
+        for i in old_indices:
+            for tc in self.messages[i].get("tool_calls", []):
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function", {})
+                if fn.get("name") != "run_query":
+                    continue
+                args_str = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                args.pop("columns", None)
+                args.pop("tables", None)
+                fn["arguments"] = json.dumps(args)
