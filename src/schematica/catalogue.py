@@ -56,6 +56,10 @@ class MeasurableMetric(BaseModel):
     agent_notes: str = Field(
         description="Reasoning behind column choices, any assumptions made, or data quality caveats"
     )
+    group: str = Field(
+        default="",
+        description="Thematic group this metric belongs to, e.g. 'Revenue', 'Customer Accounts', 'Product Usage', 'Support & Escalations'"
+    )
 
     @field_validator("sql")
     @classmethod
@@ -84,11 +88,26 @@ class QueryableFact(BaseModel):
     agent_notes: str = Field(
         description="How this fact was identified, any caveats, or freshness notes"
     )
+    group: str = Field(
+        default="",
+        description="Thematic group this fact belongs to"
+    )
 
     @field_validator("sql")
     @classmethod
     def strip_trailing_semicolon(cls, v: str) -> str:
         return v.strip().rstrip(";").strip()
+
+
+class KeyTerm(BaseModel):
+    term: str = Field(description="Domain-specific term used in this database's context")
+    definition: str = Field(description="Plain-English definition for someone unfamiliar with the domain")
+
+
+class TableRelationship(BaseModel):
+    table_a: str = Field(description="Table that holds the foreign key column")
+    table_b: str = Field(description="Table being referenced (the primary key side)")
+    join_key: str = Field(description="Column name used for the join — present under the same name in both tables")
 
 
 class TableSummary(BaseModel):
@@ -99,6 +118,10 @@ class TableSummary(BaseModel):
     )
     key_columns: list[str] = Field(
         description="Columns most relevant for measurement (date cols, numeric metrics, status fields)"
+    )
+    data_quality_notes: list[str] = Field(
+        default_factory=list,
+        description="Data quality observations specific to this table: null distributions, sparse columns, or quirks that affect metrics built on it"
     )
 
 
@@ -113,8 +136,17 @@ class DataCatalogue(BaseModel):
     description: str = Field(
         default="",
         description=(
-            "One or two sentences describing what domain or business this database covers "
-            "and what kinds of questions it can answer."
+            "Short title-worthy name for this database (3–6 words, title case). "
+            "Used as the document H1 heading. Example: 'SaaS Business Database'."
+        )
+    )
+    overview: str = Field(
+        default="",
+        description=(
+            "Multi-paragraph narrative for someone unfamiliar with this database. "
+            "Covers: what real-world domain it serves, what each table represents, "
+            "key relationships between tables, what kinds of analysis the data supports, "
+            "and any important context about data coverage or history."
         )
     )
     tables: list[TableSummary]
@@ -134,4 +166,12 @@ class DataCatalogue(BaseModel):
             "Observations about data quality, gaps, sparse columns, legacy overlap, "
             "or anything a consumer of this catalogue should be aware of"
         )
+    )
+    key_terms: list[KeyTerm] = Field(
+        default_factory=list,
+        description="Domain-specific terms used in this database that a non-specialist reader would need defined"
+    )
+    table_relationships: list[TableRelationship] = Field(
+        default_factory=list,
+        description="Foreign key relationships between tables, used to generate the relationship diagram in the overview"
     )

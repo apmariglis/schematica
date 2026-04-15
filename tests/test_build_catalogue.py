@@ -48,6 +48,23 @@ def test_build_catalogue_succeeds_with_valid_data():
     assert len(catalogue.measurable_metrics) == 1
 
 
+def test_build_catalogue_stores_overview():
+    data = {**VALID_DATA, "overview": "This database tracks widgets.\n\nTable t holds daily widget counts."}
+    catalogue = _build_catalogue(data, SNAPSHOT)
+    assert "widgets" in catalogue.overview
+
+
+def test_null_overview_falls_back_to_empty_string():
+    data = {**VALID_DATA, "overview": None}
+    catalogue = _build_catalogue(data, SNAPSHOT)
+    assert catalogue.overview == ""
+
+
+def test_absent_overview_falls_back_to_empty_string():
+    catalogue = _build_catalogue(VALID_DATA, SNAPSHOT)
+    assert catalogue.overview == ""
+
+
 # ── null optional fields fall back to defaults ────────────────────────────────
 
 def test_null_description_falls_back_to_empty_string():
