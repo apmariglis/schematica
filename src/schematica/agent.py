@@ -25,6 +25,8 @@ import json
 import os
 import re
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -37,7 +39,8 @@ from schematica.backends import _AnthropicBackend, _LiteLLMBackend
 from schematica.db import make_readonly_engine, prompt_readonly_confirmation
 
 from schematica.catalogue import DataCatalogue
-from schematica.eval import evaluate_metric, evaluate_fact
+from schematica.eval import evaluate_metric, evaluate_fact, _is_evaluator_crash
+from schematica.pricing import get_context_window as _context_window
 from schematica.introspect import introspect, render_as_text
 from schematica.pricing import format_cost
 
@@ -57,6 +60,39 @@ def _require_env(name: str) -> str:
     return val
 
 
+def _optional_env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def _check_package_versions(
+    pandas_version: str | None = None,
+    numpy_version:  str | None = None,
+) -> None:
+    """Raise RuntimeError if pandas + numpy versions are incompatible.
+
+    pandas < 2.2 uses numpy.rec internally in pd.read_sql(). numpy 2.0 removed
+    numpy.rec. The combination silently breaks every Phase 3 eval result.
+
+    Arguments allow injection for testing; production call uses installed versions.
+    """
+    import pandas
+    import numpy
+
+    pv = pandas_version or pandas.__version__
+    nv = numpy_version  or numpy.__version__
+
+    def _ver(s: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in s.split(".")[:2])
+
+    if _ver(pv) < (2, 2) and _ver(nv) >= (2, 0):
+        raise RuntimeError(
+            f"Incompatible packages: pandas {pv} + numpy {nv}.\n"
+            "pandas < 2.2 uses numpy.rec which was removed in numpy 2.0 — "
+            "every eval metric will fail with 'No module named numpy.rec'.\n"
+            "Fix: uv add \"pandas>=2.2\" \"numpy>=2.0\""
+        )
+
+
 MODEL              = _require_env("SC_MODEL")
 MAX_ROWS           = int(_require_env("SC_MAX_ROWS"))
 MAX_CHARS          = int(_require_env("SC_MAX_CHARS"))
@@ -69,7 +105,7 @@ _REFINEMENT_BUDGET   = int(_require_env("SC_REFINEMENT_BUDGET"))
 _MAX_OUTPUT_TOKENS   = int(_require_env("SC_MAX_OUTPUT_TOKENS"))
 # SC_CACHE=true uses the native Anthropic SDK with prompt caching.
 # Caching requires an anthropic/ model — fail loudly if misconfigured.
-_CACHE = _require_env("SC_CACHE").lower() == "true"
+_CACHE = _optional_env("SC_CACHE", "false").lower() == "true"
 if _CACHE and not MODEL.startswith("anthropic/"):
     raise RuntimeError(
         f"SC_CACHE=true requires a model with the 'anthropic/' prefix, got: {MODEL!r}. "
@@ -77,6 +113,32 @@ if _CACHE and not MODEL.startswith("anthropic/"):
     )
 # The Anthropic SDK expects the bare model name without the provider prefix.
 _ANTHROPIC_MODEL = MODEL[len("anthropic/"):] if MODEL.startswith("anthropic/") else MODEL
+
+
+def _apply_model_override(new_model: str, cache_override: "bool | None" = None) -> None:
+    """Update MODEL, _ANTHROPIC_MODEL, and _CACHE after CLI --model / --cache flags.
+
+    cache_override=True  → --cache flag was passed; enable caching
+    cache_override=None  → no flag; keep _CACHE as set by SC_CACHE in .env (default false)
+
+    Rules:
+      - Non-anthropic model always sets _CACHE=False (caching is Anthropic-only).
+        Passing cache_override=True with a non-anthropic model is an error.
+      - Anthropic model with cache_override=True overrides .env value.
+      - Anthropic model with no flag leaves _CACHE unchanged.
+    """
+    global MODEL, _ANTHROPIC_MODEL, _CACHE
+    if not new_model.startswith("anthropic/"):
+        if cache_override is True:
+            raise RuntimeError(
+                f"--cache requires a model with the 'anthropic/' prefix, got: {new_model!r}. "
+                "Prompt caching is only supported by Anthropic models."
+            )
+        _CACHE = False
+    elif cache_override is True:
+        _CACHE = True
+    MODEL = new_model
+    _ANTHROPIC_MODEL = new_model[len("anthropic/"):] if new_model.startswith("anthropic/") else new_model
 
 # Descriptions for warn codes that appear in Phase 3 eval results.
 # Only codes that actually appear in a run are shown in the legend.
@@ -142,6 +204,7 @@ def _tables_used_violations(items: list[dict]) -> list[str]:
 def _uncovered_fk_pairs(
     metrics: list[dict],
     fk_pairs: list[tuple[str, str]],
+    lookup_tables: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     """
     Return FK pairs that have no covering metric.
@@ -161,23 +224,266 @@ def _uncovered_fk_pairs(
     if not fk_pairs:
         return []
 
-    # Build a set of frozensets so direction doesn't matter for lookup
+    exempt = {t.lower() for t in (lookup_tables or set())}
     uncovered = []
     for from_table, to_table in fk_pairs:
-        pair = frozenset({from_table.lower(), to_table.lower()})
+        ft, tt = from_table.lower(), to_table.lower()
+        if ft in exempt or tt in exempt:
+            continue
+        pair = frozenset({ft, tt})
         covered = any(
             pair <= _tables_referenced_in_sql(m.get("sql", ""))
             for m in metrics
             if isinstance(m, dict)
         )
         if not covered:
-            uncovered.append((from_table.lower(), to_table.lower()))
+            uncovered.append((ft, tt))
     return uncovered
 
 
 def _phase1_budget(n_tables: int) -> int:
     """Exploration iteration budget, scales with database size."""
     return min(_BUDGET_BASE + n_tables * _BUDGET_MULTIPLIER, _BUDGET_CAP)
+
+
+_JSON_STRING_FIELDS: dict[str, type] = {
+    "tables": list,
+    "measurable_metrics": list,
+    "queryable_facts": list,
+    "time_coverage": dict,
+}
+
+
+def _coerce_json_strings(data: dict) -> dict:
+    """Return a copy of *data* with JSON-encoded string fields parsed to native types.
+
+    Some LLMs double-encode nested structures — e.g. submitting
+    ``"tables": "[{...}]"`` instead of ``"tables": [{...}]``.
+    For each known list/dict field, if the value is a string we attempt
+    ``json.loads``; on failure the original string is kept so downstream
+    validators can produce a meaningful error.
+    """
+    out = dict(data)
+    for field, expected_type in _JSON_STRING_FIELDS.items():
+        val = out.get(field)
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+            except (ValueError, TypeError):
+                pass
+            else:
+                if isinstance(parsed, expected_type):
+                    out[field] = parsed
+    return out
+
+
+def _format_iter_stats(
+    in_tokens: int,
+    out_tokens: int,
+    model: str,
+    pricing: dict | None = None,
+    tracker: "_RequestTracker | None" = None,
+    now: float = 0.0,
+    iter_duration: float = 0.0,
+    total_in: int = 0,
+    total_out: int = 0,
+    total_cost: float = 0.0,
+    iter_num: int = 0,
+    max_iter: int = 0,
+    context_window: int = 0,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> str:
+    """Return a box-formatted stats block for the ↳ separator between iterations.
+
+    The box has two rows:
+      call  — per-iteration tokens, cost, and wall-clock duration
+      total — accumulated tokens, cost, elapsed time, req count, rpm, this-min
+              (only shown when a tracker is provided)
+    """
+    from schematica.pricing import CACHE_WRITE_MULTIPLIER, CACHE_READ_MULTIPLIER, get_model_pricing
+
+    p = get_model_pricing(model, pricing)
+    iter_cost = (in_tokens * p["input"] + out_tokens * p["output"]) / 1_000_000
+    if cache_creation_tokens:
+        iter_cost += cache_creation_tokens * p.get("cache_write", p["input"] * CACHE_WRITE_MULTIPLIER) / 1_000_000
+    if cache_read_tokens:
+        iter_cost += cache_read_tokens * p.get("cache_read", p["input"] * CACHE_READ_MULTIPLIER) / 1_000_000
+
+    def _fmt_dur(secs: float) -> str:
+        if secs < 60:
+            return f"{secs:.1f}s"
+        m, s = divmod(int(secs), 60)
+        return f"{m}m{s:02d}s"
+
+    _iter_label = f"current iter {iter_num}/{max_iter}" if iter_num and max_iter else "current iter"
+    _ITER_HDR  = f"─ {_iter_label} "
+    _ACCUM_HDR = "─ accumulated "
+    _FOOTER    = "─ each iteration = 1 LLM call "
+    _SEP       = " · "
+
+    # Total effective input for context-fill % includes all token types
+    effective_in = in_tokens + cache_creation_tokens + cache_read_tokens
+    _fill = f"{_SEP}{effective_in / context_window * 100:.1f}% ctx" if context_window > 0 else ""
+
+    # Build optional cache fields shown inline after "in"
+    _cache_parts = ""
+    if cache_read_tokens:
+        _cache_parts += f"{_SEP}{cache_read_tokens:,} cached"
+    if cache_creation_tokens:
+        _cache_parts += f"{_SEP}{cache_creation_tokens:,} cache↑"
+
+    iter_content = (
+        f"  {in_tokens:,} in{_cache_parts}{_SEP}{out_tokens:,} out{_SEP}${iter_cost:.4f}{_SEP}{_fmt_dur(iter_duration)}{_fill}  "
+    )
+
+    if tracker is not None and tracker.total > 0:
+        elapsed = now - tracker._started_at
+        iter_per_min = tracker.rpm(now)
+        accum_content = (
+            f"  {total_in:,} in{_SEP}{total_out:,} out{_SEP}${total_cost:.4f}"
+            f"{_SEP}{_fmt_dur(elapsed)}{_SEP}{iter_per_min:.1f} iter/min  "
+        )
+        inner_w = max(
+            len(iter_content),
+            len(accum_content),
+            len(_ITER_HDR) + 2,
+            len(_ACCUM_HDR) + 2,
+            len(_FOOTER) + 2,
+        )
+        iter_padded  = iter_content.ljust(inner_w)
+        accum_padded = accum_content.ljust(inner_w)
+        top    = "╭" + _ITER_HDR  + "─" * (inner_w - len(_ITER_HDR))  + "╮"
+        mid    = "├" + _ACCUM_HDR + "─" * (inner_w - len(_ACCUM_HDR)) + "┤"
+        bottom = "╰" + _FOOTER    + "─" * (inner_w - len(_FOOTER))    + "╯"
+        return "\n".join([top, f"│{iter_padded}│", mid, f"│{accum_padded}│", bottom])
+    else:
+        inner_w = max(len(iter_content), len(_ITER_HDR) + 2, len(_FOOTER) + 2)
+        iter_padded = iter_content.ljust(inner_w)
+        top    = "╭" + _ITER_HDR + "─" * (inner_w - len(_ITER_HDR)) + "╮"
+        bottom = "╰" + _FOOTER   + "─" * (inner_w - len(_FOOTER))   + "╯"
+        return "\n".join([top, f"│{iter_padded}│", bottom])
+
+
+def _calc_rpm(n_requests: int, elapsed_secs: float) -> float:
+    """Return requests-per-minute rate; 0.0 when there is no data yet."""
+    if n_requests <= 0 or elapsed_secs <= 0:
+        return 0.0
+    return (n_requests / elapsed_secs) * 60.0
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Return the retry-after hint from a rate-limit exception header, or None.
+
+    Works for any backend that exposes exc.response.headers['retry-after'].
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", {}) or {}
+    val = headers.get("retry-after")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+# Conservative default for Anthropic tier-1 accounts.  Updated at runtime from
+# the anthropic-ratelimit-output-tokens-limit response header.
+_DEFAULT_OUTPUT_TPM = 16_000
+
+
+class _OutputTokenBucket:
+    """Rolling 60-second window tracker for proactive output-token rate limiting.
+
+    Only used with the Anthropic backend, where the per-minute limit can be read
+    from response headers.  Records actual output tokens after each API call and
+    sleeps before the next call when the expected output would exceed the limit.
+    """
+
+    WINDOW = 60.0  # seconds
+
+    def __init__(self, limit: int = _DEFAULT_OUTPUT_TPM) -> None:
+        self._limit = limit
+        self._window: deque[tuple[float, int]] = deque()
+
+    def update_limit(self, limit: int) -> None:
+        """Update the per-minute output token limit (from API response headers)."""
+        self._limit = limit
+
+    def record(self, now: float, tokens: int) -> None:
+        """Record that `tokens` output tokens were generated at wall-clock `now`."""
+        self._evict(now)
+        if tokens > 0:
+            self._window.append((now, tokens))
+
+    def tokens_in_window(self, now: float) -> int:
+        """Sum of output tokens generated in the last 60 seconds."""
+        self._evict(now)
+        return sum(t for _, t in self._window)
+
+    def _evict(self, now: float) -> None:
+        while self._window and now - self._window[0][0] >= self.WINDOW:
+            self._window.popleft()
+
+    def proactive_wait(self, now: float, expected: int) -> float:
+        """Sleep until there is headroom for `expected` output tokens.
+
+        Iterates the window oldest-first, dropping entries until used + expected
+        fits within the limit.  The wait duration is the time until the newest
+        entry that must be dropped leaves the 60-second window.
+        Returns seconds slept (0.0 if no wait was needed).
+        """
+        self._evict(now)
+        used = sum(t for _, t in self._window)
+        if used + expected <= self._limit:
+            return 0.0
+
+        need_to_drop = used + expected - self._limit
+        dropped = 0
+        wait_secs = 0.0
+        for ts, tok in self._window:  # oldest → newest
+            dropped += tok
+            age = now - ts
+            wait_secs = self.WINDOW - age + 0.5  # 0.5 s safety buffer
+            if dropped >= need_to_drop:
+                break
+
+        if wait_secs > 0:
+            console.print(
+                f"[yellow]  Output token budget ({used:,}/{self._limit:,} per min) — "
+                f"waiting {wait_secs:.0f}s before next call[/yellow]"
+            )
+            time.sleep(wait_secs)
+        return wait_secs
+
+
+class _RequestTracker:
+    """Tracks total API requests and a per-minute window counter.
+
+    `in_minute` resets to zero each time 60 seconds have elapsed since
+    the start of the current minute window.
+    """
+
+    def __init__(self, started_at: float) -> None:
+        self._started_at = started_at
+        self._minute_start = started_at
+        self.total = 0
+        self.in_minute = 0
+
+    def record(self, now: float) -> None:
+        """Record one completed API call at wall-clock time `now`."""
+        if now - self._minute_start >= 60.0:
+            self._minute_start = now
+            self.in_minute = 0
+        self.total += 1
+        self.in_minute += 1
+
+    def rpm(self, now: float) -> float:
+        """Overall requests-per-minute since the run started."""
+        return _calc_rpm(self.total, now - self._started_at)
 
 
 SYSTEM_PROMPT = """\
@@ -224,6 +530,14 @@ available. Compile everything you have learned and submit the catalogue. \
 You already have all the information you need from Phase 1.
 
 General rules:
+- The "overview" field is a multi-paragraph narrative (3–6 paragraphs, plain prose, \
+  no bullet points) written for someone who has never seen this database before. It must cover: \
+  (1) what real-world domain or business this database serves; \
+  (2) what each table represents and what entity or event it captures; \
+  (3) key relationships between tables (who links to whom and why); \
+  (4) what kinds of analysis or questions the data supports; \
+  (5) any important context about data coverage, history, or limitations. \
+  The "description" field is a single sentence summary of the same.
 - Prefer monthly aggregations for event-level data.
 - Only include SQL that you have validated by running it in Phase 1.
 - Be honest about confidence: high = unambiguous columns, medium = inferred \
@@ -278,6 +592,25 @@ General rules:
   time-series form of the join — not just a static aggregate. If the time-series \
   query returns a valid (period, value) result, that join must produce a metric, \
   not a fact.
+- Each TableSummary must include a data_quality_notes list with observations specific \
+  to that table: high null counts (with exact counts from n_null), sparse columns, \
+  ambiguous values, or quirks that would affect metrics built on that table. \
+  Move per-table observations here rather than to the catalogue-level data_quality_notes. \
+  Reserve catalogue-level data_quality_notes for cross-table observations and general \
+  database limitations only.
+- Every metric must have a group field: a short thematic label (2-4 words) shared \
+  with related metrics, e.g. 'Revenue', 'Customer Accounts', 'Product Usage', \
+  'Support & Escalations'. Use 3-6 groups that reflect the natural analytical \
+  domains in the data. All metrics in the same analytical area must share the same \
+  group string exactly.
+- key_terms: Identify 5-10 domain-specific terms that appear in metric names, \
+  descriptions, or column names that a reader unfamiliar with this business domain \
+  would need defined. Each term needs a plain-English definition (1-2 sentences). \
+  Include only business/domain vocabulary specific to this data — not generic \
+  technical terms like SQL or database.
+- table_relationships: For each foreign key relationship declared in the schema \
+  snapshot, record table_a (the table that holds the FK column), table_b (the \
+  table being referenced), and join_key (the shared column name used to join them).
 
 METRIC SQL MUST RETURN EXACTLY 2 COLUMNS: a date/period column and a single \
 numeric value column. Never include a category or dimension column as a third column.
@@ -387,6 +720,57 @@ _RUN_QUERY_TOOL = {
     },
 }
 
+_BARE_TABLES_ERROR_MSG = (
+    'tables entries must be full objects, not bare strings. '
+    'Each entry must look like: '
+    '{"name": "orders", "row_count": 12500, "description": "One row per order.", '
+    '"key_columns": ["order_id", "created_at"]}. '
+    'Do not pass table names as plain strings.'
+)
+
+_TABLES_NOT_LIST_ERROR_MSG = (
+    'tables must be a list of table objects, not a string. '
+    'You submitted tables as a single string value instead of an array. '
+    'Pass tables as a JSON array: '
+    '[{"name": "orders", "row_count": 12500, "description": "...", "key_columns": [...]}]. '
+    'Do not JSON-encode the array — pass the list directly.'
+)
+
+_FK_REJECTION_MSG = (
+    "Missing cross-table metrics for FK relationships: {pairs_str}. "
+    "Look at the run_query calls you already made in this session — if any contain "
+    "JOIN clauses between these tables, extract them as measurable_metrics now. "
+    "Each FK relationship requires at least one measurable_metric whose SQL JOINs "
+    "both tables and returns (period, aggregate_value). "
+    "A queryable_fact with a JOIN does not satisfy this requirement."
+)
+
+# Number of consecutive FK-only rejections before a pair is waived.
+# Prevents infinite rejection loops when the agent cannot or will not produce
+# a JOIN metric for a given pair.
+_FK_REJECTION_CAP = 2
+
+
+def _update_fk_waived(
+    missing_fks: list[tuple[str, str]],
+    fk_rejection_counts: dict,
+    fk_waived: set,
+    cap: int = _FK_REJECTION_CAP,
+) -> tuple[dict, set]:
+    """Increment per-pair rejection counts; move any pair that hits *cap* into *fk_waived*.
+
+    Returns updated (fk_rejection_counts, fk_waived). Both arguments are mutated
+    in-place and also returned for convenience.
+    Pair direction is normalised via frozenset so (a, b) and (b, a) share one counter.
+    """
+    for a, b in missing_fks:
+        key = frozenset({a, b})
+        fk_rejection_counts[key] = fk_rejection_counts.get(key, 0) + 1
+        if fk_rejection_counts[key] >= cap:
+            fk_waived.add(key)
+    return fk_rejection_counts, fk_waived
+
+
 _FINISH_CATALOGUE_TOOL = {
     "name": "finish_catalogue",
     "description": (
@@ -399,6 +783,12 @@ _FINISH_CATALOGUE_TOOL = {
         "properties": {
             "tables": {
                 "type": "array",
+                "description": (
+                    'Each entry is a full object — NOT a string. '
+                    'Example: {"name": "orders", "row_count": 12500, '
+                    '"description": "One row per order.", '
+                    '"key_columns": ["order_id", "created_at"]}.'
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
@@ -406,6 +796,7 @@ _FINISH_CATALOGUE_TOOL = {
                         "row_count":   {"type": "integer"},
                         "description": {"type": "string"},
                         "key_columns": {"type": "array", "items": {"type": "string"}},
+                        "data_quality_notes": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": ["name", "row_count", "description", "key_columns"],
                 },
@@ -434,10 +825,12 @@ _FINISH_CATALOGUE_TOOL = {
                         "tables_used": {"type": "array", "items": {"type": "string"}},
                         "confidence":  {"type": "string", "enum": ["high", "medium", "low"]},
                         "agent_notes": {"type": "string"},
+                        "group": {"type": "string"},
                     },
                     "required": [
                         "name", "description", "sql", "time_range",
                         "granularity", "unit", "tables_used", "confidence", "agent_notes",
+                        "group",
                     ],
                 },
             },
@@ -468,18 +861,56 @@ _FINISH_CATALOGUE_TOOL = {
                 "type": "array",
                 "items": {"type": "string"},
             },
+            "key_terms": {
+                "type": "array",
+                "description": "Domain-specific terms and their plain-English definitions",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "term":       {"type": "string"},
+                        "definition": {"type": "string"},
+                    },
+                    "required": ["term", "definition"],
+                },
+            },
+            "table_relationships": {
+                "type": "array",
+                "description": "Foreign key relationships between tables",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "table_a":  {"type": "string", "description": "Table holding the FK"},
+                        "table_b":  {"type": "string", "description": "Referenced table"},
+                        "join_key": {"type": "string", "description": "Shared column name"},
+                    },
+                    "required": ["table_a", "table_b", "join_key"],
+                },
+            },
             "description": {
                 "type": "string",
                 "description": (
-                    "One or two sentences describing what domain or business this database covers "
-                    "and what kinds of questions it can answer."
+                    "A short, title-worthy name for this database (3–6 words). "
+                    "Use title case. Examples: 'SaaS Business Database', "
+                    "'E-Commerce Orders Database', 'Music Streaming Database'. "
+                    "Do NOT write a full sentence — this is used as a document title."
+                ),
+            },
+            "overview": {
+                "type": "string",
+                "description": (
+                    "Multi-paragraph narrative for someone unfamiliar with this database. "
+                    "Cover: what real-world domain it serves, what each table represents, "
+                    "key relationships between tables, what kinds of analysis the data supports, "
+                    "and any important context about data coverage or history. "
+                    "3-6 paragraphs. Plain prose — no bullet points."
                 ),
             },
         },
         "required": [
             "tables", "measurable_metrics", "queryable_facts",
             "time_coverage", "data_quality_notes",
-            "description",
+            "description", "overview",
+            "key_terms", "table_relationships",
         ],
     },
 }
@@ -494,6 +925,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
     Introspects the schema, runs a two-phase agentic loop to identify and
     validate measurable metrics, then writes the DataCatalogue to out_path.
     """
+    _check_package_versions()
     _print_header(connection_string, out_path)
 
     # For SQLite, verify the file exists before spending any tokens.
@@ -524,16 +956,45 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
         for fk in t.get("foreign_keys", [])
     ]
 
+    # Small tables (≤20 rows) are lookup/reference tables used to enrich other
+    # metrics — they don't need their own cross-table time-series metric.
+    _LOOKUP_ROW_THRESHOLD = 20
+
+    # Pure junction tables (every column is a FK column, e.g. PlaylistTrack with
+    # only PlaylistId and TrackId) have no temporal data and cannot produce a
+    # time-series metric on their own — exempt them too.
+    _fk_cols_by_table: dict[str, set[str]] = {
+        t["name"].lower(): {
+            col.lower()
+            for fk in t.get("foreign_keys", [])
+            for col in fk.get("from_cols", [])
+        }
+        for t in snapshot["tables"]
+    }
+    junction_tables: set[str] = {
+        t["name"].lower()
+        for t in snapshot["tables"]
+        if (cols := {c["name"].lower() for c in t.get("columns", [])})
+        and cols == _fk_cols_by_table.get(t["name"].lower(), set())
+    }
+
+    lookup_tables: set[str] = {
+        t["name"].lower()
+        for t in snapshot["tables"]
+        if t.get("row_count", 0) <= _LOOKUP_ROW_THRESHOLD
+    } | junction_tables
+
     engine = make_readonly_engine(connection_string)
     n_tables = len(snapshot["tables"])
     budget = _phase1_budget(n_tables)
     min_iter = max(_MIN_ITER_FLOOR, budget // _MIN_ITER_DIVISOR)
     console.print(f"[dim]Exploration budget: {budget} iterations for {n_tables} tables  (min {min_iter} before finish)[/dim]\n")
 
-    usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation_tokens": 0, "cache_read_tokens": 0}
+    usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation_tokens": 0, "cache_read_tokens": 0, "total_cost": 0.0}
     started_at = time.monotonic()
+    req_tracker = _RequestTracker(started_at)
     try:
-        catalogue_data = _agent_loop(schema_text, engine, budget, min_iter, usage, table_columns, fk_pairs)
+        catalogue_data = _agent_loop(schema_text, engine, budget, min_iter, usage, table_columns, fk_pairs, lookup_tables, started_at, req_tracker)
     except Exception as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         catalogue_data = None
@@ -559,8 +1020,8 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
 
     catalogue = _build_catalogue(catalogue_data, snapshot)
     catalogue = _drop_broken_sql(catalogue, engine)
-    catalogue, final_metric_results, final_fact_results, uncovered_tables = _run_phase3(
-        catalogue, schema_text, engine, usage, table_columns
+    catalogue, final_metric_results, final_fact_results, uncovered_tables = _run_phase3_safe(
+        _run_phase3, catalogue, schema_text, engine, usage, table_columns, tracker=req_tracker
     )
     _write_output(catalogue, out_path)
     _print_summary(catalogue, usage, elapsed_secs, final_metric_results, final_fact_results, uncovered_tables)
@@ -569,23 +1030,42 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
 
 
 def _call_with_retry(backend, tools: list, max_tokens: int = _MAX_OUTPUT_TOKENS, max_attempts: int = 7):
-    """Call backend.call() with exponential backoff on rate-limit errors."""
+    """Call backend.call() with backoff on rate-limit errors.
+
+    Uses the retry-after header hint from the exception when available (exact
+    wait the API requested).  Falls back to exponential backoff otherwise.
+    """
     delay = 30
     for attempt in range(1, max_attempts + 1):
         try:
             return backend.call(tools, max_tokens)
         except Exception as exc:
             msg = str(exc).lower()
+            is_unsupported_tools = (
+                "does not support parameters" in msg and "tools" in msg
+            ) or (
+                "unsupportedparams" in msg and "tools" in msg
+            )
+            if is_unsupported_tools:
+                raise RuntimeError(
+                    f"Model does not support tool calls, which schematica requires. "
+                    "Choose a model with function/tool calling support "
+                    "(e.g. gemini/gemini-2.5-flash, anthropic/claude-sonnet-4-6)."
+                ) from exc
             is_rate_limit = "rate limit" in msg or "ratelimit" in msg or "429" in msg or "rate_limited" in msg
             is_transient = "empty choices" in msg or "overloaded" in msg or "503" in msg or "502" in msg
             if not (is_rate_limit or is_transient) or attempt == max_attempts:
                 raise
+            hint = _retry_after_seconds(exc)
+            wait = hint if hint is not None else delay
+            source = "API hint" if hint is not None else "own backoff"
             console.print(
-                f"[yellow]  Rate limit hit — waiting {delay}s before retry "
-                f"(attempt {attempt}/{max_attempts - 1})[/yellow]"
+                f"[yellow]  Rate limit hit — waiting {wait:.0f}s before retry "
+                f"(attempt {attempt}/{max_attempts - 1}, {source})[/yellow]"
             )
-            time.sleep(delay)
-            delay = min(delay * 2, 300)
+            time.sleep(wait)
+            if hint is None:
+                delay = min(delay * 2, 300)
 
 
 def _make_backend(initial_user_text: str, system_prompt: str) -> "_AnthropicBackend | _LiteLLMBackend":
@@ -603,7 +1083,7 @@ def _make_backend(initial_user_text: str, system_prompt: str) -> "_AnthropicBack
 
 # ── agent loop ─────────────────────────────────────────────────────────────────
 
-def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: int, usage: dict, table_columns: dict, fk_pairs: list[tuple[str, str]] | None = None) -> dict:
+def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: int, usage: dict, table_columns: dict, fk_pairs: list[tuple[str, str]] | None = None, lookup_tables: set[str] | None = None, started_at: float = 0.0, tracker: "_RequestTracker | None" = None) -> dict:
     initial_message = (
         f"Here is the complete schema snapshot of the database:\n\n"
         f"```\n{schema_text}\n```\n\n"
@@ -618,7 +1098,7 @@ def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: i
     backend = _make_backend(initial_message, SYSTEM_PROMPT)
 
     # Phase 1 — exploration with both tools available.
-    catalogue_data, last_rejection_reasons = _run_phase(
+    catalogue_data, last_rejection_reasons, _ = _run_phase(
         backend, engine,
         tools=[_RUN_QUERY_TOOL, _FINISH_CATALOGUE_TOOL],
         max_iter=phase1_budget,
@@ -627,6 +1107,8 @@ def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: i
         usage=usage,
         table_columns=table_columns,
         fk_pairs=fk_pairs,
+        lookup_tables=lookup_tables,
+        tracker=tracker,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -658,14 +1140,14 @@ def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: i
 
     backend.append_user(phase2_prompt)
 
-    catalogue_data, _ = _run_phase(
+    catalogue_data, _, _ = _run_phase(
         backend, engine,
         tools=[_FINISH_CATALOGUE_TOOL],
         max_iter=5,
         phase_label="2 (documentation)",
         usage=usage,
         table_columns=table_columns,
-        fk_pairs=fk_pairs,
+        tracker=tracker,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -673,17 +1155,86 @@ def _agent_loop(schema_text: str, engine, phase1_budget: int, phase1_min_iter: i
     raise RuntimeError("Agent did not produce a catalogue after both phases.")
 
 
-def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, usage: dict, table_columns: dict, min_iter: int = 0, fk_pairs: list[tuple[str, str]] | None = None) -> tuple[dict | None, list]:
-    """Run one phase of the agent loop. Returns (catalogue_data, last_rejection_reasons)."""
+def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, usage: dict, table_columns: dict, min_iter: int = 0, fk_pairs: list[tuple[str, str]] | None = None, lookup_tables: set[str] | None = None, tracker: "_RequestTracker | None" = None) -> tuple[dict | None, list, int]:
+    """Run one phase of the agent loop. Returns (catalogue_data, last_rejection_reasons, iterations_run)."""
+    from schematica.pricing import get_model_pricing
+
+    # Proactive output-token throttling: only for the Anthropic backend, where
+    # the per-minute limit is available from response headers.
+    output_bucket: _OutputTokenBucket | None = (
+        _OutputTokenBucket() if isinstance(backend, _AnthropicBackend) else None
+    )
+    last_out_tokens: int = 0  # previous iteration's output; used as estimate
+
     last_rejection_reasons: list[str] = []
+    fk_rejection_counts: dict = {}
+    fk_waived: set = set()
+    prev_stats: str = ""
     for i in range(1, max_iter + 1):
         rejection_reasons: list[str] = []
+        if prev_stats:
+            for line in prev_stats.splitlines():
+                console.print(f"[dim]  {line}[/dim]")
+            console.print()
+            prev_stats = ""
         console.print(f"[dim]  Phase {phase_label} — iteration {i}/{max_iter}…[/dim]")
 
-        response = _call_with_retry(backend, tools)
+        call_start = time.monotonic()
+        if output_bucket is not None:
+            waited = output_bucket.proactive_wait(now=call_start, expected=last_out_tokens)
+            if waited > 0:
+                console.print(
+                    f"[yellow]  Output token budget near limit — waited {waited:.1f}s "
+                    f"(proactive throttle)[/yellow]"
+                )
 
-        for key, val in backend.extract_usage(response).items():
+        response = _call_with_retry(backend, tools)
+        now = time.monotonic()
+        iter_duration = now - call_start
+
+        if tracker is not None:
+            tracker.record(now=now)
+
+        iter_usage = backend.extract_usage(response)
+        for key, val in iter_usage.items():
             usage[key] += val
+
+        iter_in           = iter_usage.get("input_tokens", 0)
+        iter_out          = iter_usage.get("output_tokens", 0)
+        iter_cache_create = iter_usage.get("cache_creation_tokens", 0)
+        iter_cache_read   = iter_usage.get("cache_read_tokens", 0)
+
+        if output_bucket is not None:
+            output_bucket.record(now=now, tokens=iter_out)
+            rl = backend.last_output_rate_limit()
+            if rl.get("limit"):
+                new_limit = rl["limit"]
+                if new_limit != output_bucket._limit:
+                    console.print(
+                        f"[dim]  Output token limit updated from API headers: "
+                        f"{output_bucket._limit:,} → {new_limit:,} tokens/min[/dim]"
+                    )
+                output_bucket.update_limit(new_limit)
+        _p = get_model_pricing(MODEL)
+        from schematica.pricing import CACHE_WRITE_MULTIPLIER, CACHE_READ_MULTIPLIER
+        usage["total_cost"] += (iter_in * _p["input"] + iter_out * _p["output"]) / 1_000_000
+        if iter_cache_create:
+            usage["total_cost"] += iter_cache_create * _p.get("cache_write", _p["input"] * CACHE_WRITE_MULTIPLIER) / 1_000_000
+        if iter_cache_read:
+            usage["total_cost"] += iter_cache_read * _p.get("cache_read", _p["input"] * CACHE_READ_MULTIPLIER) / 1_000_000
+        prev_stats = _format_iter_stats(
+            iter_in, iter_out, MODEL,
+            tracker=tracker, now=now,
+            iter_duration=iter_duration,
+            total_in=usage.get("input_tokens", 0),
+            total_out=usage.get("output_tokens", 0),
+            total_cost=usage["total_cost"],
+            iter_num=i,
+            max_iter=max_iter,
+            context_window=_context_window(MODEL),
+            cache_creation_tokens=iter_cache_create,
+            cache_read_tokens=iter_cache_read,
+        )
 
         backend.append_assistant(response)
 
@@ -730,31 +1281,40 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
                 backend.append_user(
                     "You have explored enough. Call finish_catalogue now with everything "
                     "you have learned. Include all tables, measurable_metrics, queryable_facts, "
-                    "time_coverage, data_quality_notes, and description."
+                    "time_coverage, data_quality_notes, description, and overview."
                 )
                 continue
             console.print(f"[yellow]  Agent produced no tool calls in phase {phase_label}[/yellow]")
-            return None, last_rejection_reasons
+            return None, last_rejection_reasons, i
 
         # Process all tool_use blocks and collect results as (tool_id, content) pairs
         pending_results: list[tuple[str, str]] = []
         catalogue_data = None
 
+        # Run all run_query blocks concurrently, then print results in order.
+        # executor.map preserves input order so zip is safe.
+        run_query_blocks = [b for b in tool_use_blocks if b.name == "run_query"]
+        for block, (block_id, result) in zip(
+            run_query_blocks, _run_queries_parallel(engine, run_query_blocks)
+        ):
+            _print_query(
+                sql=block.input["sql"],
+                reason=block.input.get("reason", ""),
+                tables=block.input.get("tables", []),
+                columns=block.input.get("columns", []),
+                plain_language=block.input.get("plain_language", ""),
+                result=result,
+                table_columns=table_columns,
+            )
+            pending_results.append((block_id, result))
+
         for block in tool_use_blocks:
             if block.name == "run_query":
-                result = _execute_query(engine, block.input["sql"], block.input.get("reason", ""))
-                _print_query(
-                    sql=block.input["sql"],
-                    reason=block.input.get("reason", ""),
-                    tables=block.input.get("tables", []),
-                    columns=block.input.get("columns", []),
-                    plain_language=block.input.get("plain_language", ""),
-                    result=result,
-                    table_columns=table_columns,
-                )
-                pending_results.append((block.id, result))
+                continue  # already handled above
 
             elif block.name == "finish_catalogue":
+                # Normalise fields the model may have JSON-encoded as strings.
+                block.input = _coerce_json_strings(block.input)
                 # Coerce data_quality_notes to a list of strings — models sometimes
                 # submit a count, a single string, or a list of non-strings.
                 # If it's not a proper list of strings, discard it so the
@@ -762,13 +1322,27 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
                 dqn = block.input.get("data_quality_notes")
                 if not isinstance(dqn, list) or not all(isinstance(n, str) for n in dqn):
                     block.input["data_quality_notes"] = []
-                required = {"tables", "measurable_metrics", "queryable_facts", "time_coverage", "description"}
+                required = {"tables", "measurable_metrics", "queryable_facts", "time_coverage", "description", "overview"}
                 missing = required - block.input.keys()
                 empty_required = [
                     k for k in ("tables", "measurable_metrics")
                     if k in block.input and not block.input[k]
                 ]
                 rejection_reasons = []
+                # tables submitted as a non-list type (e.g. entire catalogue JSON as string)
+                raw_tables = block.input.get("tables", [])
+                if not isinstance(raw_tables, list):
+                    block.input["tables"] = []
+                    rejection_reasons.append(
+                        f"tables is {type(raw_tables).__name__!r}, not a list. "
+                        + _TABLES_NOT_LIST_ERROR_MSG
+                    )
+                # tables submitted as bare name strings instead of TableSummary objects
+                elif raw_tables and isinstance(raw_tables[0], str):
+                    block.input["tables"] = []
+                    rejection_reasons.append(
+                        f"tables[0] is {raw_tables[0]!r} (a string). " + _BARE_TABLES_ERROR_MSG
+                    )
                 if block.input.get("_compressed"):
                     rejection_reasons.append(
                         "Your previous finish_catalogue was truncated mid-response because the JSON "
@@ -812,18 +1386,18 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
                         "in the SQL FROM/JOIN clauses:\n  " + "\n  ".join(tables_used_errors)
                     )
                 # FK coverage: every FK relationship must have at least one metric
-                # whose SQL JOINs both tables.
+                # whose SQL JOINs both tables. Pairs that have been rejected
+                # _FK_REJECTION_CAP times are waived to prevent infinite loops.
                 if fk_pairs:
                     submitted_metrics = [m for m in block.input.get("measurable_metrics", []) if isinstance(m, dict)]
-                    missing_fks = _uncovered_fk_pairs(submitted_metrics, fk_pairs)
+                    effective_fk_pairs = [p for p in fk_pairs if frozenset(p) not in fk_waived]
+                    missing_fks = _uncovered_fk_pairs(submitted_metrics, effective_fk_pairs, lookup_tables)
                     if missing_fks:
-                        pairs_str = ", ".join(f"{a}↔{b}" for a, b in missing_fks)
-                        rejection_reasons.append(
-                            f"Missing cross-table metrics for FK relationships: {pairs_str}. "
-                            "Each FK relationship requires at least one measurable_metric whose "
-                            "SQL JOINs both tables and returns (period, aggregate_value). "
-                            "A queryable_fact with a JOIN does not satisfy this requirement."
+                        fk_rejection_counts, fk_waived = _update_fk_waived(
+                            missing_fks, fk_rejection_counts, fk_waived
                         )
+                        pairs_str = ", ".join(f"{a}↔{b}" for a, b in missing_fks)
+                        rejection_reasons.append(_FK_REJECTION_MSG.format(pairs_str=pairs_str))
                 # Pre-validate metrics and facts against the Pydantic schema so
                 # validation errors are returned to the agent rather than crashing.
                 if not rejection_reasons:
@@ -856,12 +1430,15 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
                     # compact summary so it doesn't bloat the context on every subsequent
                     # iteration. The tool_result feedback is sufficient for the agent to
                     # know what was missing.
+                    _raw_tables  = block.input.get("tables")
+                    _raw_metrics = block.input.get("measurable_metrics")
+                    _raw_facts   = block.input.get("queryable_facts")
                     _compress_summary = {
                         "_compressed": True,
                         "description": (block.input.get("description") or "")[:120],
-                        "tables": [t.get("name", "?") if isinstance(t, dict) else str(t) for t in (block.input.get("tables") or [])],
-                        "measurable_metrics": [m.get("name", "?") if isinstance(m, dict) else str(m) for m in (block.input.get("measurable_metrics") or [])],
-                        "queryable_facts": [f.get("name", "?") if isinstance(f, dict) else str(f) for f in (block.input.get("queryable_facts") or [])],
+                        "tables": [t.get("name", "?") if isinstance(t, dict) else str(t) for t in _raw_tables] if isinstance(_raw_tables, list) else [],
+                        "measurable_metrics": [m.get("name", "?") if isinstance(m, dict) else str(m) for m in _raw_metrics] if isinstance(_raw_metrics, list) else [],
+                        "queryable_facts": [f.get("name", "?") if isinstance(f, dict) else str(f) for f in _raw_facts] if isinstance(_raw_facts, list) else [],
                         "time_coverage": block.input.get("time_coverage"),
                         "data_quality_notes": len(block.input.get("data_quality_notes") or []),
                     }
@@ -871,7 +1448,7 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
                         f"ERROR: {reasons_text}. "
                         "Resubmit finish_catalogue with all required fields present and non-empty "
                         "where data was found: tables, measurable_metrics, time_coverage, "
-                        "data_quality_notes, description. "
+                        "data_quality_notes, description, overview. "
                         "queryable_facts may be empty if none were found.",
                     ))
                 else:
@@ -896,10 +1473,15 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
 
         # Always append tool_results to keep the message history valid
         backend.append_tool_results(pending_results)
+        backend.compress_old_run_queries()
+        last_out_tokens = iter_out
 
         if catalogue_data is not None:
+            if prev_stats:
+                for line in prev_stats.splitlines():
+                    console.print(f"[dim]  {line}[/dim]")
             console.print(f"[green]  finish_catalogue called in phase {phase_label}, iteration {i}.[/green]")
-            return catalogue_data, []
+            return catalogue_data, [], i
 
         # Track last rejection reasons for the caller to use in the next phase prompt
         if rejection_reasons:
@@ -907,9 +1489,15 @@ def _run_phase(backend, engine, tools: list, max_iter: int, phase_label: str, us
 
         # If stop_reason was end_turn despite having tool_use blocks, exit phase
         if backend.stop_reason(response) == "end_turn":
-            return None, last_rejection_reasons
+            if prev_stats:
+                for line in prev_stats.splitlines():
+                    console.print(f"[dim]  {line}[/dim]")
+            return None, last_rejection_reasons, i
 
-    return None, last_rejection_reasons
+    if prev_stats:
+        for line in prev_stats.splitlines():
+            console.print(f"[dim]  {line}[/dim]")
+    return None, last_rejection_reasons, max_iter
 
 
 # ── query execution ────────────────────────────────────────────────────────────
@@ -963,6 +1551,24 @@ def _execute_query(engine, sql: str, reason: str) -> str:
         return f"ERROR: {exc}"
 
 
+def _run_queries_parallel(engine, run_query_blocks: list) -> list[tuple[str, str]]:
+    """Execute a list of run_query tool-use blocks concurrently.
+
+    Returns a list of (tool_id, result_string) pairs in the same order as the
+    input blocks.  Uses a thread pool capped at the number of blocks; SQLAlchemy
+    engines are thread-safe and manage their own connection pool.
+    """
+    if not run_query_blocks:
+        return []
+
+    def _run(block) -> tuple[str, str]:
+        result = _execute_query(engine, block.input["sql"], block.input.get("reason", ""))
+        return (block.id, result)
+
+    with ThreadPoolExecutor(max_workers=len(run_query_blocks)) as executor:
+        return list(executor.map(_run, run_query_blocks))
+
+
 # ── output construction ────────────────────────────────────────────────────────
 
 def _build_catalogue(data: dict, snapshot: dict) -> DataCatalogue:
@@ -973,11 +1579,14 @@ def _build_catalogue(data: dict, snapshot: dict) -> DataCatalogue:
             connection=snapshot["connection_string"],
             dialect=snapshot["dialect"],
             description=data.get("description") or "",
+            overview=data.get("overview") or "",
             tables=data["tables"],
             measurable_metrics=data["measurable_metrics"],
             queryable_facts=data.get("queryable_facts") or [],
             time_coverage=data["time_coverage"],
             data_quality_notes=data.get("data_quality_notes") or [],
+            key_terms=data.get("key_terms") or [],
+            table_relationships=data.get("table_relationships") or [],
         )
     except Exception as exc:
         console.print(f"[red]Catalogue validation error: {exc}[/red]")
@@ -1074,14 +1683,247 @@ def _drop_broken_sql(catalogue: DataCatalogue, engine) -> DataCatalogue:
     )
 
 
+def _render_overview_md(catalogue: "DataCatalogue") -> str:
+    """Render a structured Markdown overview of a catalogue (v6 structure)."""
+    lines: list[str] = []
+
+    # ── title ─────────────────────────────────────────────────────────────────
+    lines.append(f"# {catalogue.description or 'Database Overview'}")
+
+    n_tables  = len(catalogue.tables)
+    n_metrics = len(catalogue.measurable_metrics)
+    n_facts   = len(catalogue.queryable_facts)
+    fact_word = "fact" if n_facts == 1 else "facts"
+    date      = catalogue.analysed_at[:10]
+    tr_start  = catalogue.time_coverage.start[:7]
+    tr_end    = catalogue.time_coverage.end[:7]
+    lines.append(
+        f"> {date} · {catalogue.model} · {n_tables} tables · "
+        f"{n_metrics} metrics · {n_facts} {fact_word} · {tr_start} → {tr_end}"
+    )
+
+    # ── overview ─────────────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("## Overview")
+    lines.append(catalogue.overview)
+
+    # ── key terms ────────────────────────────────────────────────────────────
+    if catalogue.key_terms:
+        lines.append("")
+        lines.append("## Key Terms")
+        for kt in catalogue.key_terms:
+            lines.append(f"- **{kt.term}** — {kt.definition}")
+
+    # ── catalogue-level data quality notes (cross-table / general) ───────────
+    if catalogue.data_quality_notes:
+        lines.append("")
+        lines.append("## Data Quality Notes")
+        for i, note in enumerate(catalogue.data_quality_notes, 1):
+            lines.append(f"{i}. {note}")
+
+    # ── tables at a glance ───────────────────────────────────────────────────
+    lines.append("")
+    lines.append("## Tables at a Glance")
+    lines.append("")
+    lines.append("| Table | Rows | What it holds |")
+    lines.append("|---|---:|---|")
+    for t in catalogue.tables:
+        lines.append(f"| <u>**{t.name}**</u> | {t.row_count:,} | {t.description} |")
+
+    # ── table relationships (mermaid) ─────────────────────────────────────────
+    if catalogue.table_relationships:
+        lines.append("")
+        lines.append("## Table Relationships")
+        lines.append("")
+        lines.append("```mermaid")
+        lines.append('%%{init: {"flowchart": {"curve": "linear"}}}%%')
+        lines.append("flowchart TD")
+        defined: set[str] = set()
+
+        def _node(name: str) -> str:
+            if name not in defined:
+                defined.add(name)
+                return f'{name}["<u><b>{name}</b></u>"]'
+            return name
+
+        for rel in catalogue.table_relationships:
+            a = _node(rel.table_a)
+            b = _node(rel.table_b)
+            lines.append(
+                f'    {a} -->|"<u><i><b>{rel.join_key}</b></i></u>"| {b}'
+            )
+        lines.append("```")
+        lines.append("")
+        lines.append(
+            "> **Legend:** An arrow **A → B** means table A holds the foreign key "
+            "column (shown as the arrow label) that references table B. "
+            "To join two tables, match the labelled column across both."
+        )
+
+    # ── tables reference ──────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("## Tables Reference")
+    for t in catalogue.tables:
+        lines.append("")
+        lines.append(f"### <u>**{t.name}**</u>")
+        lines.append(t.description)
+        if t.key_columns:
+            cols = ", ".join(f"<u>***{c}***</u>" for c in t.key_columns)
+            lines.append(f"Columns: {cols}")
+        if t.data_quality_notes:
+            lines.append("")
+            lines.append("> **Data notes**")
+            for note in t.data_quality_notes:
+                lines.append(f"> - {note}")
+
+    # ── metrics ───────────────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("## Metrics")
+    lines.append("")
+
+    # Group metrics — use group field if set, else fall back to primary table
+    table_set = {t.name for t in catalogue.tables}
+
+    def _primary_table(tables_used: list[str]) -> str:
+        for t in tables_used:
+            if t in table_set:
+                return t
+        return "Other"
+
+    def _metric_group(m: "MeasurableMetric") -> str:
+        g = getattr(m, "group", "") or ""
+        return g if g else _primary_table(m.tables_used)
+
+    seen_groups: list[str] = []
+    groups: dict[str, list] = {}
+    for m in catalogue.measurable_metrics:
+        g = _metric_group(m)
+        if g not in groups:
+            seen_groups.append(g)
+            groups[g] = []
+        groups[g].append(m)
+
+    if seen_groups:
+        group_labels = ", ".join(f"**{g}**" for g in seen_groups)
+        lines.append(
+            f"> The thematic groups below ({group_labels}) are organisational "
+            "labels for this document — they are not tables, columns, or any "
+            "named entity in the database."
+        )
+
+    for g in seen_groups:
+        lines.append("")
+        lines.append(f"### {g}")
+        lines.append("")
+        for m in groups[g]:
+            lines.append(f"- **{m.name}**")
+            tr = f"{m.time_range.start[:7]} → {m.time_range.end[:7]}"
+            lines.append(
+                f"  ***Frequency:*** {m.granularity} · "
+                f"***Unit:*** {m.unit} · ***Range:*** {tr}"
+            )
+            lines.append(f"  {m.description}")
+            if m.tables_used:
+                tables_str = ", ".join(f"<u>**{t}**</u>" for t in m.tables_used)
+                lines.append(f"  Tables: {tables_str}")
+            lines.append("  ```sql")
+            for sql_line in m.sql.split("\n"):
+                lines.append(f"  {sql_line}")
+            lines.append("  ```")
+            if m.agent_notes:
+                lines.append(f"  > {m.agent_notes}")
+            lines.append("")
+
+    # ── facts ─────────────────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("## Facts")
+    lines.append("")
+    lines.append(
+        "> Unlike metrics, facts are not time-series. Each query below returns "
+        "a current snapshot or a static reference table — a single result set, "
+        "not a trend over time."
+    )
+    lines.append("")
+    for f in catalogue.queryable_facts:
+        lines.append(f"### {f.name}")
+        lines.append(f.description)
+        if f.tables_used:
+            tables_str = ", ".join(f"<u>**{t}**</u>" for t in f.tables_used)
+            lines.append(f"Tables: {tables_str}")
+        lines.append("```sql")
+        lines.append(f.sql)
+        lines.append("```")
+        if f.agent_notes:
+            lines.append(f"> {f.agent_notes}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
 def _write_output(catalogue: DataCatalogue, out_path: str) -> None:
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
         json.dump(catalogue.model_dump(), f, indent=2)
     console.print(f"\n[bold green]Catalogue written to {out_path}[/bold green]")
 
+    if catalogue.overview:
+        # Derive overview path: <stem replacing "_catalogue_N" with "_overview_N">.md
+        overview_path = p.parent / p.name.replace("_catalogue_", "_overview_").replace(".json", ".md")
+        overview_path.write_text(_render_overview_md(catalogue))
+        console.print(f"[bold green]Overview written to {overview_path}[/bold green]")
+
 
 # ── phase 3 — refinement ───────────────────────────────────────────────────────
+
+_DIRECTLY_PATCHED = {"date_mismatch", "period_boundary"}
+
+
+def _filter_agent_issues(
+    warn_metrics: list[tuple],
+    warn_facts:   list[tuple],
+) -> list[tuple]:
+    """Return only the (item, result) pairs that need agent investigation.
+
+    Excluded:
+      - Metrics whose only issues are date_mismatch / period_boundary (patched directly).
+      - Any result where the SQL ran fine but the eval framework crashed
+        (sql_ok=True, error starts with "eval error:") — the agent cannot fix
+        an environment problem like a missing numpy module.
+    """
+    return (
+        [
+            (m, r) for m, r in warn_metrics
+            if set((r.error or "").split(", ")) - _DIRECTLY_PATCHED
+            and not _is_evaluator_crash(r)
+        ] +
+        [(f, r) for f, r in warn_facts if not _is_evaluator_crash(r)]
+    )
+
+def _run_phase3_safe(
+    phase3_fn,
+    catalogue: "DataCatalogue",
+    schema_text: str,
+    engine,
+    usage: dict,
+    table_columns: dict,
+    **kwargs,
+) -> tuple:
+    """Call phase3_fn; on any exception fall back to the Phase 1 catalogue.
+
+    Ensures _write_output is always reached in run() even if Phase 3 crashes
+    (network error, FileNotFoundError, evaluator crash, etc.).
+    Returns (catalogue, metric_results, fact_results, uncovered_tables).
+    """
+    try:
+        return phase3_fn(catalogue, schema_text, engine, usage, table_columns, **kwargs)
+    except Exception as exc:
+        console.print(
+            f"\n[yellow]  Phase 3 failed: {exc}[/yellow]\n"
+            "  [dim]Writing Phase 1 catalogue as fallback.[/dim]"
+        )
+        return catalogue, [], [], []
+
 
 def _run_phase3(
     catalogue: DataCatalogue,
@@ -1089,6 +1931,7 @@ def _run_phase3(
     engine,
     usage: dict,
     table_columns: dict,
+    tracker: "_RequestTracker | None" = None,
 ) -> tuple[DataCatalogue, list, list, list[str]]:
     """
     Evaluate the catalogue against the live database, patch trivial issues
@@ -1198,14 +2041,7 @@ def _run_phase3(
         console.print()
 
     # ── collect issues needing agent investigation ─────────────────────────────
-    _directly_patched = {"date_mismatch", "period_boundary"}
-    agent_issues = (
-        [
-            (m, r) for m, r in warn_metrics
-            if set((r.error or "").split(", ")) - _directly_patched
-        ] +
-        [(f, r) for f, r in warn_facts]
-    )
+    agent_issues = _filter_agent_issues(warn_metrics, warn_facts)
 
     if not agent_issues:
         console.print("  [green]All issues patched directly — no agent call needed.[/green]\n")
@@ -1258,13 +2094,14 @@ def _run_phase3(
     # the full schema + catalogue JSON and is repeated across all refinement iterations.
     backend = _make_backend(refinement_prompt, REFINEMENT_SYSTEM_PROMPT)
 
-    refined_data, _ = _run_phase(
+    refined_data, _, _ = _run_phase(
         backend, engine,
         tools=[_RUN_QUERY_TOOL, _FINISH_CATALOGUE_TOOL],
         max_iter=_REFINEMENT_BUDGET,
         phase_label="3 (refinement)",
         usage=usage,
         table_columns=table_columns,
+        tracker=tracker,
     )
 
     if refined_data is None:
@@ -1570,6 +2407,8 @@ def _model_folder_name() -> str:
 
 def _next_catalogue_index(out_dir: Path, db_name: str) -> int:
     """Return the next available 1-based index for <db_name>_catalogue_<n>.json."""
+    if not out_dir.exists():
+        return 1
     existing = list(out_dir.glob(f"{db_name}_catalogue_*.json"))
     indices = []
     for p in existing:
@@ -1639,7 +2478,14 @@ def main() -> None:
                         help="Path to write the catalogue JSON (default: <db_stem>_catalogue.json)")
     parser.add_argument("--skip-ro-check", action="store_true",
                         help="Skip the read-only user confirmation prompt (for CI / automated use)")
+    parser.add_argument("--model", default=None, metavar="MODEL",
+                        help="Override SC_MODEL from .env (e.g. gpt-4o, together_ai/meta-llama/...)")
+    parser.add_argument("--cache", action="store_true", default=False,
+                        help="Enable prompt caching (anthropic/ models only). Overrides SC_CACHE=false.")
     args = parser.parse_args()
+
+    if args.model or args.cache:
+        _apply_model_override(args.model or MODEL, cache_override=True if args.cache else None)
 
     connection_string = _to_connection_string(args.db)
     prompt_readonly_confirmation(connection_string, skip=args.skip_ro_check)

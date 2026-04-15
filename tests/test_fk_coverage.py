@@ -109,3 +109,37 @@ def test_table_name_comparison_is_case_insensitive():
     ]
     result = _uncovered_fk_pairs(metrics, fk_pairs=[("orders", "customers")])
     assert result == []
+
+
+# ── lookup/reference table exemption ─────────────────────────────────────────
+
+def test_fk_pair_with_lookup_table_is_skipped():
+    # ref_status has 4 rows — it's a lookup table; no join metric required.
+    metrics = [{"name": "m", "sql": "SELECT dt, COUNT(*) FROM orders GROUP BY dt"}]
+    result = _uncovered_fk_pairs(
+        metrics,
+        fk_pairs=[("orders", "ref_status")],
+        lookup_tables={"ref_status"},
+    )
+    assert result == []
+
+
+def test_fk_pair_between_two_main_tables_is_not_skipped():
+    # Both tables are main tables — uncovered pair must still be returned.
+    metrics = [{"name": "m", "sql": "SELECT dt, COUNT(*) FROM orders GROUP BY dt"}]
+    result = _uncovered_fk_pairs(
+        metrics,
+        fk_pairs=[("orders", "customers")],
+        lookup_tables={"ref_status"},
+    )
+    assert len(result) == 1
+
+
+def test_lookup_tables_none_behaves_as_empty_set():
+    metrics = [{"name": "m", "sql": "SELECT dt, COUNT(*) FROM orders GROUP BY dt"}]
+    result = _uncovered_fk_pairs(
+        metrics,
+        fk_pairs=[("orders", "customers")],
+        lookup_tables=None,
+    )
+    assert len(result) == 1
