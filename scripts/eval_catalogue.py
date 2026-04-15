@@ -70,7 +70,8 @@ def check_table_coverage(catalogue: dict, engine) -> list[str]:
 
 # Fields that must be present and non-empty in a valid catalogue
 _REQUIRED_CATALOGUE_FIELDS: list[tuple[str, str]] = [
-    ("description",        "One-sentence dataset description (regenerate catalogue to add)"),
+    ("description", "One-sentence dataset description (regenerate catalogue to add)"),
+    ("overview",    "Multi-paragraph database overview (regenerate catalogue to add)"),
 ]
 
 
@@ -370,6 +371,15 @@ def main() -> None:
     icon = {"PASS": "[green]✓[/green]", "WARN": "[yellow]⚠[/yellow]", "FAIL": "[red]✗[/red]"}
 
     if not args.json:
+        overview = catalogue.get("overview", "").strip()
+        if overview:
+            console.print(Panel(
+                overview,
+                title=catalogue.get("description", catalogue_path.stem),
+                border_style="cyan",
+                padding=(0, 1),
+            ))
+            console.print()
         console.print(f"[dim]Evaluating {len(metrics)} metrics and {len(facts)} facts from {catalogue_path.name}…[/dim]\n")
 
     # Pre-compute duplicate SQL mapping so we can stamp results after evaluation
