@@ -10,6 +10,7 @@ import sqlite3
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 
 def make_engine(connection_string: str) -> Engine:
@@ -28,7 +29,7 @@ def make_engine(connection_string: str) -> Engine:
             conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
             return conn
 
-        return create_engine("sqlite://", creator=_creator)
+        return create_engine("sqlite://", creator=_creator, poolclass=NullPool)
 
     return create_engine(connection_string)
 
@@ -87,6 +88,6 @@ def make_readonly_engine(connection_string: str) -> Engine:
             conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
             return conn
 
-        return create_engine("sqlite://", creator=_readonly_creator)
+        return create_engine("sqlite://", creator=_readonly_creator, poolclass=NullPool)
 
     return create_engine(connection_string)
