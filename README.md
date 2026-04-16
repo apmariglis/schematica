@@ -29,7 +29,9 @@ Schematica is **read-only** — it never modifies your database. For SQLite this
 
 ```bash
 uv sync                        # Anthropic only
-uv sync --extra litellm        # add Gemini and other providers
+uv sync --extra litellm        # add Gemini and other providers via LiteLLM
+uv sync --extra postgres       # add PostgreSQL driver (psycopg2)
+uv sync --extra litellm --extra postgres   # both
 ```
 
 **2. Configure**
@@ -62,8 +64,12 @@ Any database supported by SQLAlchemy works. Output is written to `<db_dir>/<mode
 Use `--model` to override `SC_MODEL` from `.env` for a single run — useful for comparing models without editing config:
 
 ```bash
-uv run schematica --db path/to/mydb.db --model gpt-4o
+uv run schematica --db path/to/mydb.db --model gemini/gemini-2.5-flash
+uv run schematica --db path/to/mydb.db --model anthropic/claude-haiku-4-5
+uv run schematica --db path/to/mydb.db --model anthropic/claude-haiku-4-5 --cache
 ```
+
+`--cache` enables Anthropic prompt caching for the run. It only applies to `anthropic/` models — passing it with any other model emits a warning and is ignored. Without `--cache`, Anthropic models still use the native Anthropic SDK (not LiteLLM); caching is simply not enabled.
 
 **4. Evaluate the catalogue**
 
@@ -228,6 +234,9 @@ Auto-patched issues are corrected directly without an LLM call. Everything else 
 
 ## Troubleshooting
 
+**`No module named 'psycopg2'`**
+PostgreSQL requires the psycopg2 driver. Run `uv sync --extra postgres`.
+
 **`litellm` not found**
 Run `uv sync --extra litellm`. The base install only includes the Anthropic SDK.
 
@@ -256,4 +265,12 @@ The agent hit the output token limit while writing `finish_catalogue`, which tru
 
 ## Supported databases
 
-Any database supported by SQLAlchemy: SQLite, PostgreSQL, MySQL, MSSQL, and others.
+Any database supported by SQLAlchemy. Additional drivers are required for non-SQLite databases:
+
+| Database | Extra | Install |
+|---|---|---|
+| SQLite | — | included |
+| PostgreSQL | `postgres` | `uv sync --extra postgres` |
+| MySQL / MariaDB | — | `uv add mysqlclient` or `uv add pymysql` |
+| SQL Server | — | `uv add pyodbc` |
+| Oracle | — | `uv add cx_oracle` |
