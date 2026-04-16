@@ -7,6 +7,7 @@ so the caller knows the requested name was resolved to a different metric.
 """
 from __future__ import annotations
 
+import json
 import warnings
 
 import pytest
@@ -41,7 +42,6 @@ def broker(tmp_path):
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE t (dt TEXT, val REAL)"))
         conn.execute(text("INSERT INTO t VALUES ('2024-01-01', 1.0), ('2024-02-01', 2.0)"))
-    import json
     catalogue_path = tmp_path / "catalogue.json"
     catalogue_path.write_text(json.dumps(CATALOGUE))
     return DataAccessBroker(str(catalogue_path), f"sqlite:///{db_path}")

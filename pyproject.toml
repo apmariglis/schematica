@@ -17,9 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 litellm = ["litellm>=1.0"]
+postgres = ["psycopg2-binary>=2.9"]
 
 [project.scripts]
-schematica = "schematica.agent:main"
+schematica = "schematica.cli:main"
 
 [tool.uv]
 package = true

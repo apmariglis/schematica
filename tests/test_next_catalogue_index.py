@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from schematica.agent import _next_catalogue_index
+from schematica.cli import _next_catalogue_index
 
 
 def test_returns_one_when_directory_does_not_exist(tmp_path):

@@ -14,6 +14,8 @@ _format_iter_stats and the cost calc in _run_phase.
 """
 from __future__ import annotations
 
+import re
+
 from schematica.agent import _format_iter_stats, _RequestTracker
 
 
@@ -65,7 +67,6 @@ def test_zero_cache_tokens_does_not_affect_cost():
         cache_creation_tokens=0, cache_read_tokens=0,
     )
     # extract the $ figure from each
-    import re
     cost_no_args = re.search(r"\$[\d.]+", result_no_args).group()
     cost_zero    = re.search(r"\$[\d.]+", result_zero).group()
     assert cost_no_args == cost_zero
