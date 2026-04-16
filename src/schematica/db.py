@@ -6,11 +6,33 @@ dialect workarounds, future SSL / pooling config) live in one place.
 """
 from __future__ import annotations
 
+import importlib
 import sqlite3
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import NullPool
+
+
+_DRIVER_REQUIREMENTS: dict[str, tuple[str, str]] = {
+    "postgresql": ("psycopg2", "uv sync --extra postgres"),
+    "mysql":      ("MySQLdb", "uv add mysqlclient  # or: uv add pymysql"),
+    "mssql":      ("pyodbc",  "uv add pyodbc"),
+    "oracle":     ("cx_Oracle", "uv add cx_oracle"),
+}
+
+
+def _check_driver(connection_string: str) -> None:
+    """Raise a friendly ImportError if the required DB driver is not installed."""
+    for dialect, (module, install_hint) in _DRIVER_REQUIREMENTS.items():
+        if connection_string.startswith(dialect):
+            try:
+                importlib.import_module(module)
+            except ImportError:
+                raise ImportError(
+                    f"The '{module}' driver is required for {dialect} but is not installed.\n"
+                    f"Fix: {install_hint}"
+                )
 
 
 def make_engine(connection_string: str) -> Engine:
@@ -21,6 +43,7 @@ def make_engine(connection_string: str) -> Engine:
     Windows-1252 data from legacy Access / SQL Server exports) are decoded
     with replacement characters instead of raising UnicodeDecodeError.
     """
+    _check_driver(connection_string)
     if connection_string.startswith("sqlite"):
         db_path = connection_string.split("///", 1)[-1]
 
@@ -80,6 +103,7 @@ def make_readonly_engine(connection_string: str) -> Engine:
       dialects the read-only guarantee must be enforced at the database level
       by connecting with a user that has only SELECT privileges.
     """
+    _check_driver(connection_string)
     if connection_string.startswith("sqlite"):
         db_path = connection_string.split("///", 1)[-1]
 
