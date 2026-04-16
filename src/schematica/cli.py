@@ -5,6 +5,7 @@ cli.py — Command-line entry point and output path utilities.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import warnings
@@ -49,28 +50,32 @@ def _next_catalogue_index(out_dir: Path, db_name: str) -> int:
     return max(indices, default=0) + 1
 
 
-def _derive_catalogue_path(connection_string: str, model: str) -> str:
-    """
-    Derive the catalogue output path from a connection string.
+def _db_stem(connection_string: str) -> str:
+    """Extract a filesystem-safe database name from any connection string.
 
-    Catalogues are stored in data/<model>/<db_name>_catalogue_<n>.json,
-    where <n> auto-increments so repeated runs never overwrite each other.
-
-    sqlite:///data/solar_wind.db  →  data/gemini-2.5-flash/solar_wind_catalogue_1.json
-    postgresql://.../mydb         →  data/gemini-2.5-flash/mydb_catalogue_1.json
+    sqlite:///data/solar_wind.db       →  'solar_wind'
+    postgresql://user:pw@host/mydb     →  'mydb'
     """
     if connection_string.startswith("sqlite:///"):
-        db_file = Path(connection_string[len("sqlite:///") :])
-        db_name = db_file.stem
-        data_dir = db_file.parent
-    else:
-        parsed = urlparse(connection_string)
-        db_name = parsed.path.lstrip("/")
-        data_dir = Path("data")
+        return Path(connection_string[len("sqlite:///"):].split("?")[0]).stem
+    parsed = urlparse(connection_string)
+    return parsed.path.lstrip("/").split("?")[0] or "db"
 
-    out_dir = data_dir / _model_folder_name(model)
-    idx = _next_catalogue_index(out_dir, db_name)
-    return str(out_dir / f"{db_name}_catalogue_{idx}.json")
+
+def _derive_catalogue_path(connection_string: str, model: str, out_dir: str) -> str:
+    """
+    Derive the catalogue output path.
+
+    Catalogues are stored as <out_dir>/<model>/<db_stem>_catalogue_<n>.json,
+    where <n> auto-increments so repeated runs never overwrite each other.
+
+    sqlite:///data/solar_wind.db  →  <out_dir>/gemini-2.5-flash/solar_wind_catalogue_1.json
+    postgresql://.../mydb         →  <out_dir>/gemini-2.5-flash/mydb_catalogue_1.json
+    """
+    db_name = _db_stem(connection_string)
+    model_dir = Path(out_dir) / _model_folder_name(model)
+    idx = _next_catalogue_index(model_dir, db_name)
+    return str(model_dir / f"{db_name}_catalogue_{idx}.json")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -87,7 +92,7 @@ def _parse_args() -> argparse.Namespace:
         "--out",
         default=None,
         metavar="OUTPUT_JSON",
-        help="Path to write the catalogue JSON (default: auto-derived from db name)",
+        help="Exact path for the catalogue JSON (overrides SC_OUTPUT_DIR)",
     )
     parser.add_argument(
         "--skip-ro-check",
@@ -144,10 +149,21 @@ def main() -> None:
     _assign_model(args)
 
     connection_string = _to_connection_string(args.db)
+
     prompt_readonly_confirmation(connection_string, skip=args.skip_ro_check)
-    out_path = args.out or _derive_catalogue_path(
-        connection_string, agent._config.model
-    )
+
+    if args.out:
+        out_path = args.out
+    else:
+        out_dir = os.environ.get("SC_OUTPUT_DIR")
+        if not out_dir:
+            print(
+                "\nError: SC_OUTPUT_DIR is not set. "
+                "Add it to .env or pass --out with an explicit path.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        out_path = _derive_catalogue_path(connection_string, agent._config.model, out_dir)
     print(f"Output → {out_path}", file=sys.stderr)
 
     try:
