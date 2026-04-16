@@ -28,10 +28,10 @@ def test_accumulated_row_present_with_tracker():
     result = _format_iter_stats(
         1000, 200, "test-model",
         {"test-model": {"input": 1.0, "output": 2.0}},
-        tracker=tracker, now=10.0,
+        session_tracker=tracker, now=10.0,
     )
 
-    assert "accumulated" in result
+    assert "session" in result
 
 
 # ── tracker persists across phases (shared object, not reset) ─────────────────
@@ -59,7 +59,7 @@ def test_tracker_iter_per_min_reflects_all_phases():
     result = _format_iter_stats(
         500, 100, "test-model",
         {"test-model": {"input": 1.0, "output": 2.0}},
-        tracker=tracker, now=60.0,
+        session_tracker=tracker, now=60.0,
     )
 
-    assert "6.0 iter/min" in result
+    assert "6.0 llm calls/min" in result

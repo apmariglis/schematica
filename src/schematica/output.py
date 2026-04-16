@@ -71,24 +71,35 @@ def _format_iter_stats(
     out_tokens: int,
     model: str,
     pricing: dict | None = None,
-    tracker: "_RequestTracker | None" = None,
-    now: float = 0.0,
+    # per-iteration
     iter_duration: float = 0.0,
-    total_in: int = 0,
-    total_out: int = 0,
-    total_cost: float = 0.0,
     iter_num: int = 0,
     max_iter: int = 0,
     context_window: int = 0,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
+    # phase-level averages (shown when phase_n > 0)
+    phase_label: str = "",
+    phase_n: int = 0,
+    phase_elapsed: float = 0.0,
+    phase_total_in: int = 0,
+    phase_total_out: int = 0,
+    phase_total_cost: float = 0.0,
+    # session totals (shown when session_tracker is provided)
+    session_tracker: "_RequestTracker | None" = None,
+    now: float = 0.0,
+    session_total_in: int = 0,
+    session_total_out: int = 0,
+    session_total_cost: float = 0.0,
 ) -> str:
-    """Return a box-formatted stats block for the ↳ separator between iterations.
+    """Return a box-formatted stats block printed between iterations.
 
-    The box has two rows:
-      call  — per-iteration tokens, cost, and wall-clock duration
-      total — accumulated tokens, cost, elapsed time, req count, rpm, this-min
-              (only shown when a tracker is provided)
+    Sections (all optional except current iter):
+      current iter    — per-call Tokens, cost, duration, context%
+      averages (phase X) — per-phase averages (phase_n > 0)
+      session         — cross-phase totals + llm calls/min (session_tracker provided)
+
+    Top border embeds "1 iter = 1 LLM call". Bottom border is plain.
     """
     p = get_model_pricing(model, pricing)
     iter_cost = (in_tokens * p["input"] + out_tokens * p["output"]) / 1_000_000
@@ -103,53 +114,125 @@ def _format_iter_stats(
         m, s = divmod(int(secs), 60)
         return f"{m}m{s:02d}s"
 
-    _iter_label = f"current iter {iter_num}/{max_iter}" if iter_num and max_iter else "current iter"
-    _ITER_HDR  = f"─ {_iter_label} "
-    _ACCUM_HDR = "─ accumulated "
-    _FOOTER    = "─ each iteration = 1 LLM call "
-    _SEP       = " · "
+    _SEP = " · "
 
-    # Total effective input for context-fill % includes all token types
+    # ── current iter content ──────────────────────────────────────────────────
     effective_in = in_tokens + cache_creation_tokens + cache_read_tokens
-    _fill = f"{_SEP}{effective_in / context_window * 100:.1f}% ctx" if context_window > 0 else ""
+    _fill = f"{_SEP}{effective_in / context_window * 100:.1f}% context" if context_window > 0 else ""
 
-    # Build optional cache fields shown inline after "in"
     _cache_parts = ""
     if cache_read_tokens:
-        _cache_parts += f"{_SEP}{cache_read_tokens:,} cached"
+        _cache_parts += f" | {cache_read_tokens:,} cached"
     if cache_creation_tokens:
-        _cache_parts += f"{_SEP}{cache_creation_tokens:,} cache↑"
+        _cache_parts += f" | {cache_creation_tokens:,} cache↑"
 
     iter_content = (
-        f"  {in_tokens:,} in{_cache_parts}{_SEP}{out_tokens:,} out{_SEP}${iter_cost:.4f}{_SEP}{_fmt_dur(iter_duration)}{_fill}  "
+        f"  Tokens: {in_tokens:,} in | {out_tokens:,} out{_cache_parts}"
+        f"{_SEP}${iter_cost:.4f}{_SEP}{_fmt_dur(iter_duration)}{_fill}  "
     )
 
-    if tracker is not None and tracker.total > 0:
-        elapsed = now - tracker._started_at
-        iter_per_min = tracker.rpm(now)
-        accum_content = (
-            f"  {total_in:,} in{_SEP}{total_out:,} out{_SEP}${total_cost:.4f}"
-            f"{_SEP}{_fmt_dur(elapsed)}{_SEP}{iter_per_min:.1f} iter/min  "
+    # ── phase averages content ────────────────────────────────────────────────
+    show_averages = phase_n > 0
+    if show_averages:
+        avg_in   = phase_total_in  // phase_n
+        avg_out  = phase_total_out // phase_n
+        avg_cost = phase_total_cost / phase_n
+        avg_dur  = phase_elapsed   / phase_n
+        avg_content = (
+            f"  Tokens: {avg_in:,} in | {avg_out:,} out"
+            f"{_SEP}${avg_cost:.4f}{_SEP}{_fmt_dur(avg_dur)}  "
         )
-        inner_w = max(
-            len(iter_content),
-            len(accum_content),
-            len(_ITER_HDR) + 2,
-            len(_ACCUM_HDR) + 2,
-            len(_FOOTER) + 2,
+
+    # ── session totals content ────────────────────────────────────────────────
+    show_session = session_tracker is not None and session_tracker.total > 0
+    if show_session:
+        session_elapsed = now - session_tracker._started_at
+        llm_calls_min   = session_tracker.rpm(now)
+        session_content = (
+            f"  Tokens: {session_total_in:,} in | {session_total_out:,} out"
+            f"{_SEP}${session_total_cost:.4f}{_SEP}{_fmt_dur(session_elapsed)}"
+            f"{_SEP}{llm_calls_min:.1f} llm calls/min  "
         )
-        iter_padded  = iter_content.ljust(inner_w)
-        accum_padded = accum_content.ljust(inner_w)
-        top    = "╭" + _ITER_HDR  + "─" * (inner_w - len(_ITER_HDR))  + "╮"
-        mid    = "├" + _ACCUM_HDR + "─" * (inner_w - len(_ACCUM_HDR)) + "┤"
-        bottom = "╰" + _FOOTER    + "─" * (inner_w - len(_FOOTER))    + "╯"
-        return "\n".join([top, f"│{iter_padded}│", mid, f"│{accum_padded}│", bottom])
-    else:
-        inner_w = max(len(iter_content), len(_ITER_HDR) + 2, len(_FOOTER) + 2)
-        iter_padded = iter_content.ljust(inner_w)
-        top    = "╭" + _ITER_HDR + "─" * (inner_w - len(_ITER_HDR)) + "╮"
-        bottom = "╰" + _FOOTER   + "─" * (inner_w - len(_FOOTER))   + "╯"
-        return "\n".join([top, f"│{iter_padded}│", bottom])
+
+    def _phase_display(label: str) -> str:
+        """'1 (exploration)' → 'phase 1 — exploration'"""
+        if " (" in label and label.endswith(")"):
+            num, rest = label.split(" (", 1)
+            return f"phase {num} — {rest[:-1]}"
+        return f"phase {label}"
+
+    # ── section headers ───────────────────────────────────────────────────────
+    _iter_label  = f"current iter {iter_num}/{max_iter}" if iter_num and max_iter else "current iter"
+    _LEFT_TOP    = f"─ {_iter_label} "
+    _RIGHT_TOP   = " 1 iter = 1 LLM call ─"
+    _AVG_HDR     = f"─ averages (per iter) [{_phase_display(phase_label)}] " if phase_label else "─ averages (per iter) "
+    _SESSION_HDR = "─ session (accumulated) "
+
+    # ── compute inner width ───────────────────────────────────────────────────
+    min_top_w = len(_LEFT_TOP) + len(_RIGHT_TOP)
+    candidates = [len(iter_content), min_top_w, len(_LEFT_TOP) + 2]
+    if show_averages:
+        candidates += [len(avg_content), len(_AVG_HDR) + 2]
+    if show_session:
+        candidates += [len(session_content), len(_SESSION_HDR) + 2]
+    inner_w = max(candidates)
+
+    # ── build borders ─────────────────────────────────────────────────────────
+    top_fill = inner_w - len(_LEFT_TOP) - len(_RIGHT_TOP)
+    top    = "╭" + _LEFT_TOP + "─" * top_fill + _RIGHT_TOP + "╮"
+    bottom = "╰" + "─" * inner_w + "╯"
+
+    def _mid(hdr: str) -> str:
+        return "├" + hdr + "─" * (inner_w - len(hdr)) + "┤"
+
+    def _row(content: str) -> str:
+        return f"│{content.ljust(inner_w)}│"
+
+    # ── assemble ──────────────────────────────────────────────────────────────
+    lines = [top, _row(iter_content)]
+    if show_averages:
+        lines += [_mid(_AVG_HDR), _row(avg_content)]
+    if show_session:
+        lines += [_mid(_SESSION_HDR), _row(session_content)]
+    lines.append(bottom)
+    return "\n".join(lines)
+
+
+def _format_phase_summary(
+    phase_label: str,
+    phase_n: int,
+    phase_elapsed: float,
+    phase_total_in: int,
+    phase_total_out: int,
+    phase_total_cost: float,
+) -> str:
+    """Return a summary block printed once when a phase ends."""
+    def _fmt_dur(secs: float) -> str:
+        if secs < 60:
+            return f"{secs:.1f}s"
+        m, s = divmod(int(secs), 60)
+        return f"{m}m{s:02d}s"
+
+    avg_in   = phase_total_in  // phase_n if phase_n else 0
+    avg_out  = phase_total_out // phase_n if phase_n else 0
+    avg_cost = phase_total_cost / phase_n if phase_n else 0.0
+    avg_dur  = phase_elapsed   / phase_n if phase_n else 0.0
+
+    def _phase_display(label: str) -> str:
+        if " (" in label and label.endswith(")"):
+            num, rest = label.split(" (", 1)
+            return f"phase {num} — {rest[:-1]}"
+        return f"phase {label}"
+
+    _SEP     = " · "
+    title    = f"── {_phase_display(phase_label)} complete "
+    content  = (
+        f"   Tokens: {avg_in:,} in | {avg_out:,} out avg"
+        f"{_SEP}${avg_cost:.4f} avg{_SEP}{_fmt_dur(avg_dur)} avg{_SEP}{phase_n} iters"
+    )
+    width    = max(len(title) + 2, len(content) + 2)
+    bar      = "─" * width
+    return "\n".join([title + "─" * (width - len(title)), content, bar])
 
 
 def _print_header(connection_string: str, out_path: str, model: str, cache: bool) -> None:

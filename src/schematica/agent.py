@@ -50,6 +50,7 @@ from schematica.introspect import render_as_text
 from schematica.output import _PHASE3_WARN_LEGEND
 from schematica.output import _calc_rpm
 from schematica.output import _format_iter_stats
+from schematica.output import _format_phase_summary
 from schematica.output import _print_finish_catalogue
 from schematica.output import _print_header
 from schematica.output import _print_query
@@ -774,6 +775,28 @@ def _run_phase(
     )
     last_out_tokens: int = 0  # previous iteration's output; used as estimate
 
+    # Per-phase tracking — resets each time _run_phase is called.
+    phase_start = time.monotonic()
+    phase_in: int = 0
+    phase_out: int = 0
+    phase_cost: float = 0.0
+    phase_n: int = 0
+
+    def _flush_stats(stats: str) -> None:
+        """Print pending stats box, then a phase summary line."""
+        if stats:
+            for line in stats.splitlines():
+                console.print(f"[dim]  {line}[/dim]")
+            console.print()
+        if phase_n > 0:
+            summary = _format_phase_summary(
+                phase_label, phase_n, time.monotonic() - phase_start,
+                phase_in, phase_out, phase_cost,
+            )
+            for line in summary.splitlines():
+                console.print(f"[dim]{line}[/dim]")
+            console.print()
+
     last_rejection_reasons: list[str] = []
     fk_rejection_counts: dict = {}
     fk_waived: set = set()
@@ -827,36 +850,47 @@ def _run_phase(
                 output_bucket.update_limit(new_limit)
         _p = get_model_pricing(_config.model)
 
-        usage["total_cost"] += (
-            iter_in * _p["input"] + iter_out * _p["output"]
-        ) / 1_000_000
+        iter_cost = (iter_in * _p["input"] + iter_out * _p["output"]) / 1_000_000
         if iter_cache_create:
-            usage["total_cost"] += (
+            iter_cost += (
                 iter_cache_create
                 * _p.get("cache_write", _p["input"] * CACHE_WRITE_MULTIPLIER)
                 / 1_000_000
             )
         if iter_cache_read:
-            usage["total_cost"] += (
+            iter_cost += (
                 iter_cache_read
                 * _p.get("cache_read", _p["input"] * CACHE_READ_MULTIPLIER)
                 / 1_000_000
             )
+        usage["total_cost"] += iter_cost
+
+        phase_in   += iter_in
+        phase_out  += iter_out
+        phase_cost += iter_cost
+        phase_n    += 1
+
         prev_stats = _format_iter_stats(
             iter_in,
             iter_out,
             _config.model,
-            tracker=tracker,
-            now=now,
             iter_duration=iter_duration,
-            total_in=usage.get("input_tokens", 0),
-            total_out=usage.get("output_tokens", 0),
-            total_cost=usage["total_cost"],
             iter_num=i,
             max_iter=max_iter,
             context_window=_context_window(_config.model),
             cache_creation_tokens=iter_cache_create,
             cache_read_tokens=iter_cache_read,
+            phase_label=phase_label,
+            phase_n=phase_n,
+            phase_elapsed=now - phase_start,
+            phase_total_in=phase_in,
+            phase_total_out=phase_out,
+            phase_total_cost=phase_cost,
+            session_tracker=tracker,
+            now=now,
+            session_total_in=usage.get("input_tokens", 0),
+            session_total_out=usage.get("output_tokens", 0),
+            session_total_cost=usage["total_cost"],
         )
 
         backend.append_assistant(response)
@@ -1162,9 +1196,7 @@ def _run_phase(
         last_out_tokens = iter_out
 
         if catalogue_data is not None:
-            if prev_stats:
-                for line in prev_stats.splitlines():
-                    console.print(f"[dim]  {line}[/dim]")
+            _flush_stats(prev_stats)
             console.print(
                 f"[green]  finish_catalogue called in phase {phase_label}, iteration {i}.[/green]"
             )
@@ -1176,14 +1208,10 @@ def _run_phase(
 
         # If stop_reason was end_turn despite having tool_use blocks, exit phase
         if backend.stop_reason(response) == "end_turn":
-            if prev_stats:
-                for line in prev_stats.splitlines():
-                    console.print(f"[dim]  {line}[/dim]")
+            _flush_stats(prev_stats)
             return None, last_rejection_reasons, i
 
-    if prev_stats:
-        for line in prev_stats.splitlines():
-            console.print(f"[dim]  {line}[/dim]")
+    _flush_stats(prev_stats)
     return None, last_rejection_reasons, max_iter
 
 
