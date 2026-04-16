@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from schematica.agent import _format_iter_stats, _format_phase_summary, _RequestTracker
+from schematica.agent import _format_iter_stats, _format_completed_phases_box, _RequestTracker
 
 
 _MOCK_PRICING = {
@@ -276,7 +276,7 @@ def test_averages_row_present_when_phase_n_provided():
 
 
 def test_averages_row_includes_phase_label():
-    # "1 (exploration)" is rendered as "phase 1 — exploration"
+    # "1 (exploration)" is rendered as "phase 1 ─ exploration"
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
         phase_label="1 (exploration)",
@@ -424,52 +424,60 @@ def test_all_box_lines_have_equal_width_full_box():
     )
 
 
-# ── _format_phase_summary ─────────────────────────────────────────────────────
+# ── _format_completed_phases_box ──────────────────────────────────────────────
 
-def test_phase_summary_returns_string():
-    result = _format_phase_summary(
-        phase_label="1 (exploration)",
-        phase_n=10, phase_elapsed=120.0,
-        phase_total_in=50000, phase_total_out=2000, phase_total_cost=0.0540,
-    )
+_PHASE1 = {"label": "1 (exploration)",    "n": 16, "elapsed": 96.0,  "total_in": 172_221, "total_out": 22_264, "total_cost": 0.1073}
+_PHASE2 = {"label": "2 (documentation)", "n":  4, "elapsed": 24.0,  "total_in":  43_052, "total_out":  5_566, "total_cost": 0.0268}
+
+
+def test_completed_phases_box_returns_string():
+    result = _format_completed_phases_box([_PHASE1])
     assert isinstance(result, str)
 
 
-def test_phase_summary_includes_phase_label():
-    # "1 (exploration)" is rendered as "phase 1 — exploration"
-    result = _format_phase_summary(
-        phase_label="1 (exploration)",
-        phase_n=5, phase_elapsed=60.0,
-        phase_total_in=5000, phase_total_out=500, phase_total_cost=0.0060,
-    )
+def test_completed_phases_box_shows_complete_phases_title():
+    result = _format_completed_phases_box([_PHASE1])
+    assert "complete phases" in result
+
+
+def test_completed_phases_box_shows_phase_label():
+    # "1 (exploration)" → "phase 1 ─ exploration"
+    result = _format_completed_phases_box([_PHASE1])
     assert "phase 1" in result
     assert "exploration" in result
 
 
-def test_phase_summary_includes_iter_count():
-    result = _format_phase_summary(
-        phase_label="1",
-        phase_n=31, phase_elapsed=300.0,
-        phase_total_in=31000, phase_total_out=3100, phase_total_cost=0.0370,
-    )
-    assert "31" in result
-
-
-def test_phase_summary_includes_avg_tokens():
-    # phase_n=2, phase_total_in=1000 → avg 500
-    result = _format_phase_summary(
-        phase_label="1",
-        phase_n=2, phase_elapsed=20.0,
-        phase_total_in=1000, phase_total_out=200, phase_total_cost=0.0010,
-    )
+def test_completed_phases_box_shows_avg_tokens():
+    # phase_n=2, total_in=1000 → avg 500
+    phase = {"label": "1", "n": 2, "elapsed": 20.0, "total_in": 1000, "total_out": 200, "total_cost": 0.0010}
+    result = _format_completed_phases_box([phase])
     assert "500" in result
 
 
-def test_phase_summary_includes_avg_cost():
-    # phase_n=4, phase_total_cost=0.0200 → avg $0.0050
-    result = _format_phase_summary(
-        phase_label="1",
-        phase_n=4, phase_elapsed=40.0,
-        phase_total_in=400, phase_total_out=200, phase_total_cost=0.0200,
-    )
+def test_completed_phases_box_shows_avg_cost():
+    # phase_n=4, total_cost=0.0200 → avg $0.0050
+    phase = {"label": "1", "n": 4, "elapsed": 40.0, "total_in": 400, "total_out": 200, "total_cost": 0.0200}
+    result = _format_completed_phases_box([phase])
     assert "0.0050" in result
+
+
+def test_completed_phases_box_shows_iter_count():
+    phase = {"label": "1", "n": 31, "elapsed": 300.0, "total_in": 31000, "total_out": 3100, "total_cost": 0.0370}
+    result = _format_completed_phases_box([phase])
+    assert "31" in result
+
+
+def test_completed_phases_box_shows_all_phases():
+    result = _format_completed_phases_box([_PHASE1, _PHASE2])
+    assert "phase 1" in result
+    assert "phase 2" in result
+    assert "exploration" in result
+    assert "documentation" in result
+
+
+def test_completed_phases_box_all_lines_equal_width():
+    result = _format_completed_phases_box([_PHASE1, _PHASE2])
+    lines = result.splitlines()
+    assert len(set(len(l) for l in lines)) == 1, (
+        f"Box lines have unequal widths: {[len(l) for l in lines]}"
+    )

@@ -155,17 +155,17 @@ def _format_iter_stats(
         )
 
     def _phase_display(label: str) -> str:
-        """'1 (exploration)' → 'phase 1 — exploration'"""
+        """'1 (exploration)' → 'phase 1 ─ exploration'"""
         if " (" in label and label.endswith(")"):
             num, rest = label.split(" (", 1)
-            return f"phase {num} — {rest[:-1]}"
+            return f"phase {num} ─ {rest[:-1]}"
         return f"phase {label}"
 
     # ── section headers ───────────────────────────────────────────────────────
     _iter_label  = f"current iter {iter_num}/{max_iter}" if iter_num and max_iter else "current iter"
     _LEFT_TOP    = f"─ {_iter_label} "
     _RIGHT_TOP   = " 1 iter = 1 LLM call ─"
-    _AVG_HDR     = f"─ averages (per iter) [{_phase_display(phase_label)}] " if phase_label else "─ averages (per iter) "
+    _AVG_HDR     = f"─ averages ({_phase_display(phase_label)}) " if phase_label else "─ averages "
     _SESSION_HDR = "─ session (accumulated) "
 
     # ── compute inner width ───────────────────────────────────────────────────
@@ -198,41 +198,59 @@ def _format_iter_stats(
     return "\n".join(lines)
 
 
-def _format_phase_summary(
-    phase_label: str,
-    phase_n: int,
-    phase_elapsed: float,
-    phase_total_in: int,
-    phase_total_out: int,
-    phase_total_cost: float,
-) -> str:
-    """Return a summary block printed once when a phase ends."""
+def _format_completed_phases_box(phases: list[dict]) -> str:
+    """Return a box summarising all completed phases.
+
+    Each entry in `phases` must have keys:
+      label, n, elapsed, total_in, total_out, total_cost
+    """
     def _fmt_dur(secs: float) -> str:
         if secs < 60:
             return f"{secs:.1f}s"
         m, s = divmod(int(secs), 60)
         return f"{m}m{s:02d}s"
 
-    avg_in   = phase_total_in  // phase_n if phase_n else 0
-    avg_out  = phase_total_out // phase_n if phase_n else 0
-    avg_cost = phase_total_cost / phase_n if phase_n else 0.0
-    avg_dur  = phase_elapsed   / phase_n if phase_n else 0.0
-
     def _phase_display(label: str) -> str:
         if " (" in label and label.endswith(")"):
             num, rest = label.split(" (", 1)
-            return f"phase {num} — {rest[:-1]}"
+            return f"phase {num} ─ {rest[:-1]}"
         return f"phase {label}"
 
-    _SEP     = " · "
-    title    = f"── {_phase_display(phase_label)} complete "
-    content  = (
-        f"   Tokens: {avg_in:,} in | {avg_out:,} out avg"
-        f"{_SEP}${avg_cost:.4f} avg{_SEP}{_fmt_dur(avg_dur)} avg{_SEP}{phase_n} iters"
+    _SEP   = " · "
+    _TITLE = " complete phases "
+
+    rows: list[tuple[str, str]] = []
+    for ph in phases:
+        display = _phase_display(ph["label"])
+        n       = ph["n"]
+        avg_in   = ph["total_in"]  // n
+        avg_out  = ph["total_out"] // n
+        avg_cost = ph["total_cost"]  / n
+        avg_dur  = ph["elapsed"]     / n
+        content = (
+            f"  Tokens: {avg_in:,} in | {avg_out:,} out avg"
+            f"{_SEP}${avg_cost:.4f} avg{_SEP}{_fmt_dur(avg_dur)} avg{_SEP}{n} iters  "
+        )
+        rows.append((display, content))
+
+    phase_hdrs = [f"── {display} " for display, _ in rows]
+    inner_w = max(
+        len(_TITLE) + 4,
+        *(len(h) + 2 for h in phase_hdrs),
+        *(len(c)     for _, c in rows),
     )
-    width    = max(len(title) + 2, len(content) + 2)
-    bar      = "─" * width
-    return "\n".join([title + "─" * (width - len(title)), content, bar])
+
+    side  = (inner_w - len(_TITLE)) // 2
+    extra = inner_w - len(_TITLE) - side * 2
+    top   = "╭" + "─" * side + _TITLE + "─" * (side + extra) + "╮"
+
+    lines = [top]
+    for (display, content), hdr in zip(rows, phase_hdrs):
+        lines.append("├" + hdr + "─" * (inner_w - len(hdr)) + "┤")
+        lines.append(f"│{content.ljust(inner_w)}│")
+
+    lines.append("╰" + "─" * inner_w + "╯")
+    return "\n".join(lines)
 
 
 def _print_header(connection_string: str, out_path: str, model: str, cache: bool) -> None:

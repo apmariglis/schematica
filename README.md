@@ -120,40 +120,6 @@ uv run python scripts/compare_catalogues.py \
 
 ---
 
-## Progress display
-
-While running, schematica prints a live stats box after each iteration:
-
-```
-  Phase 1 (exploration) — iteration 4/31…
-  [tool calls, query results…]
-  ╭─ current iter 4/31 ──────────────── 1 iter = 1 LLM call ───────────────╮
-  │  Tokens: 7,104 in | 201 out · $0.0026 · 1.7s · 3.6% context           │
-  ├─ averages (per iter) [phase 1 — exploration] ──────────────────────────┤
-  │  Tokens: 6,350 in | 180 out · $0.0023 · 1.5s                           │
-  ├─ session (accumulated) ────────────────────────────────────────────────┤
-  │  Tokens: 28,419 in | 804 out · $0.0104 · 18.5s · 10.5 llm calls/min   │
-  ╰────────────────────────────────────────────────────────────────────────╯
-  Phase 1 (exploration) — iteration 5/31…
-```
-
-When a phase ends, a one-line summary is printed:
-
-```
-── phase 1 — exploration complete ───────────────────────────────────────────
-   Tokens: 6,350 in | 180 out avg · $0.0023 avg · 1.5s avg · 31 iters
-─────────────────────────────────────────────────────────────────────────────
-```
-
-**current iter** — tokens sent/received, cost, and wall-clock time for that single LLM call, plus how full the context window is (`% context`).
-
-**averages (per iter)** — per-phase averages: mean tokens, cost, and duration per iteration. Resets at each phase boundary.
-
-**session (accumulated)** — cross-phase totals: tokens, cost, elapsed time, and average LLM call throughput across the whole run.
-
-Context window fill (`% context`) is shown when the model is recognised. It is derived from the input token count, which equals the full conversation history sent on each call.
-
----
 
 ## Output
 

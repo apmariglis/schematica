@@ -50,7 +50,7 @@ from schematica.introspect import render_as_text
 from schematica.output import _PHASE3_WARN_LEGEND
 from schematica.output import _calc_rpm
 from schematica.output import _format_iter_stats
-from schematica.output import _format_phase_summary
+from schematica.output import _format_completed_phases_box
 from schematica.output import _print_finish_catalogue
 from schematica.output import _print_header
 from schematica.output import _print_query
@@ -498,6 +498,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
     }
     started_at = time.monotonic()
     req_tracker = _RequestTracker(started_at)
+    completed_phases: list[dict] = []
     try:
         catalogue_data = _agent_loop(
             schema_text,
@@ -510,6 +511,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
             lookup_tables,
             started_at,
             req_tracker,
+            completed_phases,
         )
     except Exception as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
@@ -549,6 +551,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
             usage,
             table_columns,
             tracker=req_tracker,
+            completed_phases=completed_phases,
         )
     )
     _write_output(catalogue, out_path)
@@ -677,6 +680,7 @@ def _agent_loop(
     lookup_tables: set[str] | None = None,
     started_at: float = 0.0,
     tracker: "_RequestTracker | None" = None,
+    completed_phases: "list[dict] | None" = None,
 ) -> dict:
     initial_message = (
         f"Here is the complete schema snapshot of the database:\n\n"
@@ -704,6 +708,7 @@ def _agent_loop(
         fk_pairs=fk_pairs,
         lookup_tables=lookup_tables,
         tracker=tracker,
+        completed_phases=completed_phases,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -746,6 +751,7 @@ def _agent_loop(
         usage=usage,
         table_columns=table_columns,
         tracker=tracker,
+        completed_phases=completed_phases,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -765,6 +771,7 @@ def _run_phase(
     fk_pairs: list[tuple[str, str]] | None = None,
     lookup_tables: set[str] | None = None,
     tracker: "_RequestTracker | None" = None,
+    completed_phases: "list[dict] | None" = None,
 ) -> tuple[dict | None, list, int]:
     """Run one phase of the agent loop. Returns (catalogue_data, last_rejection_reasons, iterations_run)."""
 
@@ -782,19 +789,26 @@ def _run_phase(
     phase_cost: float = 0.0
     phase_n: int = 0
 
+    _phases = completed_phases if completed_phases is not None else []
+
     def _flush_stats(stats: str) -> None:
-        """Print pending stats box, then a phase summary line."""
+        """Print pending stats box, then update the completed phases box."""
         if stats:
             for line in stats.splitlines():
                 console.print(f"[dim]  {line}[/dim]")
             console.print()
         if phase_n > 0:
-            summary = _format_phase_summary(
-                phase_label, phase_n, time.monotonic() - phase_start,
-                phase_in, phase_out, phase_cost,
-            )
-            for line in summary.splitlines():
-                console.print(f"[dim]{line}[/dim]")
+            _phases.append({
+                "label":      phase_label,
+                "n":          phase_n,
+                "elapsed":    time.monotonic() - phase_start,
+                "total_in":   phase_in,
+                "total_out":  phase_out,
+                "total_cost": phase_cost,
+            })
+            box = _format_completed_phases_box(_phases)
+            for line in box.splitlines():
+                console.print(f"[dim]  {line}[/dim]")
             console.print()
 
     last_rejection_reasons: list[str] = []
@@ -870,7 +884,7 @@ def _run_phase(
         phase_cost += iter_cost
         phase_n    += 1
 
-        prev_stats = _format_iter_stats(
+        _iter_stats = _format_iter_stats(
             iter_in,
             iter_out,
             _config.model,
@@ -892,6 +906,10 @@ def _run_phase(
             session_total_out=usage.get("output_tokens", 0),
             session_total_cost=usage["total_cost"],
         )
+        if _phases:
+            prev_stats = _iter_stats + "\n\n" + _format_completed_phases_box(_phases)
+        else:
+            prev_stats = _iter_stats
 
         backend.append_assistant(response)
 
@@ -1655,6 +1673,7 @@ def _run_phase3(
     usage: dict,
     table_columns: dict,
     tracker: "_RequestTracker | None" = None,
+    completed_phases: "list[dict] | None" = None,
 ) -> tuple[DataCatalogue, list, list, list[str]]:
     """
     Evaluate the catalogue against the live database, patch trivial issues
@@ -1852,6 +1871,7 @@ def _run_phase3(
         usage=usage,
         table_columns=table_columns,
         tracker=tracker,
+        completed_phases=completed_phases,
     )
 
     if refined_data is None:
