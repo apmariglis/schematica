@@ -40,20 +40,24 @@ def _try_int(val) -> int | None:
 class _AnthropicBackend:
     """Anthropic-native backend. Maintains messages in Anthropic format."""
 
-    def __init__(self, client, model: str, system_prompt: str, messages: list):
+    def __init__(self, client, model: str, system_prompt: str, messages: list, cache: bool = False):
         self._client = client
         self._model = model
         self._system = system_prompt
+        self._cache = cache
         self.messages = messages  # shared, mutated in-place
 
     def call(self, tools: list, max_tokens: int):
         # Streaming is required for requests that may take longer than 10 minutes.
         # get_final_message() returns a Message object with the same interface as
         # the non-streaming create() response, so no other code needs to change.
+        system_block = {"type": "text", "text": self._system}
+        if self._cache:
+            system_block["cache_control"] = {"type": "ephemeral"}
         with self._client.messages.stream(
             model=self._model,
             max_tokens=max_tokens,
-            system=[{"type": "text", "text": self._system, "cache_control": {"type": "ephemeral"}}],
+            system=[system_block],
             messages=self.messages,
             tools=tools,
         ) as stream:
