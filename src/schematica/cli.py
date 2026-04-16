@@ -91,8 +91,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         default=None,
-        metavar="OUTPUT_JSON",
-        help="Exact path for the catalogue JSON (overrides SC_OUTPUT_DIR)",
+        metavar="OUTPUT_DIR",
+        help="Output directory for catalogue files (overrides SC_OUTPUT_DIR from .env)",
     )
     parser.add_argument(
         "--skip-ro-check",
@@ -142,7 +142,7 @@ def main() -> None:
       schematica --db path/to/mydb.db
       schematica --db sqlite:///path/to/mydb.db
       schematica --db postgresql://user:pass@host:5432/mydb
-      schematica --db path/to/mydb.db --out path/to/custom.json
+      schematica --db path/to/mydb.db --out path/to/output/dir
     """
     args = _parse_args()
 
@@ -152,18 +152,15 @@ def main() -> None:
 
     prompt_readonly_confirmation(connection_string, skip=args.skip_ro_check)
 
-    if args.out:
-        out_path = args.out
-    else:
-        out_dir = os.environ.get("SC_OUTPUT_DIR")
-        if not out_dir:
-            print(
-                "\nError: SC_OUTPUT_DIR is not set. "
-                "Add it to .env or pass --out with an explicit path.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        out_path = _derive_catalogue_path(connection_string, agent._config.model, out_dir)
+    out_dir = args.out or os.environ.get("SC_OUTPUT_DIR")
+    if not out_dir:
+        print(
+            "\nError: no output directory set. "
+            "Add SC_OUTPUT_DIR to .env or pass --out <dir>.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    out_path = _derive_catalogue_path(connection_string, agent._config.model, out_dir)
     print(f"Output → {out_path}", file=sys.stderr)
 
     try:

@@ -59,7 +59,13 @@ uv run schematica --db mssql+pyodbc://user:pw@dsn          # SQL Server
 uv run schematica --db oracle+cx_oracle://user:pw@host/sid # Oracle
 ```
 
-Any database supported by SQLAlchemy works. Output is written to `<db_dir>/<model>/<db_stem>_catalogue_<n>.json`. For example, running against `data/sales.db` with `gemini-2.5-flash` produces `data/gemini-2.5-flash/sales_catalogue_1.json`. Each run gets an auto-incremented index so repeated runs never overwrite each other.
+Any database supported by SQLAlchemy works. Output is written to `<SC_OUTPUT_DIR>/<model>/<db_stem>_catalogue_<n>.json`. For example, with `SC_OUTPUT_DIR=data` and model `gemini-2.5-flash`, running against `sales.db` produces `data/gemini-2.5-flash/sales_catalogue_1.json`. Each run gets an auto-incremented index so repeated runs never overwrite each other.
+
+`SC_OUTPUT_DIR` must be set in `.env`, or passed per-run with `--out`:
+
+```bash
+uv run schematica --db path/to/mydb.db --out path/to/output/dir
+```
 
 Use `--model` to override `SC_MODEL` from `.env` for a single run — useful for comparing models without editing config:
 
@@ -121,25 +127,50 @@ While running, schematica prints a live stats box after each iteration:
 ```
   Phase 1 (exploration) — iteration 4/31…
   [tool calls, query results…]
-  ╭─ current iter 4/31 ─────────────────────────────────────────────╮
-  │  7,104 in · 201 out · $0.0026 · 1.7s · 3.6% ctx                │
-  ├─ accumulated ───────────────────────────────────────────────────┤
-  │  28,419 in · 804 out · $0.0104 · 18.5s · 13.0 iter/min         │
-  ╰─ each iteration = 1 LLM call ──────────────────────────────────╯
+  ╭─ current iter 4/31 ──────────────── 1 iter = 1 LLM call ───────────────╮
+  │  Tokens: 7,104 in | 201 out · $0.0026 · 1.7s · 3.6% context           │
+  ├─ averages (per iter) [phase 1 — exploration] ──────────────────────────┤
+  │  Tokens: 6,350 in | 180 out · $0.0023 · 1.5s                           │
+  ├─ session (accumulated) ────────────────────────────────────────────────┤
+  │  Tokens: 28,419 in | 804 out · $0.0104 · 18.5s · 10.5 llm calls/min   │
+  ╰────────────────────────────────────────────────────────────────────────╯
   Phase 1 (exploration) — iteration 5/31…
 ```
 
-**current iter** — tokens sent/received, cost, and wall-clock time for that single LLM call, plus how full the context window is (`% ctx`).
+When a phase ends, a one-line summary is printed:
 
-**accumulated** — session totals: tokens, cost, elapsed time, and average throughput in iterations per minute.
+```
+── phase 1 — exploration complete ───────────────────────────────────────────
+   Tokens: 6,350 in | 180 out avg · $0.0023 avg · 1.5s avg · 31 iters
+─────────────────────────────────────────────────────────────────────────────
+```
 
-Context window fill (`% ctx`) is shown when the model is recognised. It is derived from the input token count, which equals the full conversation history sent on each call.
+**current iter** — tokens sent/received, cost, and wall-clock time for that single LLM call, plus how full the context window is (`% context`).
+
+**averages (per iter)** — per-phase averages: mean tokens, cost, and duration per iteration. Resets at each phase boundary.
+
+**session (accumulated)** — cross-phase totals: tokens, cost, elapsed time, and average LLM call throughput across the whole run.
+
+Context window fill (`% context`) is shown when the model is recognised. It is derived from the input token count, which equals the full conversation history sent on each call.
 
 ---
 
 ## Output
 
-`data_catalogue.json` contains:
+Each run produces two files in `<SC_OUTPUT_DIR>/<model>/`:
+
+| File | Description |
+|---|---|
+| `<db>_catalogue_<n>.json` | Structured catalogue — metrics, facts, time coverage, data quality notes |
+| `<db>_overview_<n>.md` | Human-readable Markdown overview (only written when the agent produces a narrative summary) |
+
+The overview Markdown includes a one-paragraph database description, key terms, a Mermaid entity-relationship diagram, a tables-at-a-glance table, and the full metric and fact listing with SQL. It is intended to be committed alongside the catalogue JSON as living documentation.
+
+---
+
+### Catalogue JSON
+
+`<db>_catalogue_<n>.json` contains:
 
 ```json
 {
@@ -171,6 +202,8 @@ Context window fill (`% ctx`) is shown when the model is recognised. It is deriv
   "data_quality_notes": [...]
 }
 ```
+
+Alongside the catalogue JSON, schematica also writes a `<db>_overview_<n>.md` — a human-readable Markdown version of the same content.
 
 ---
 
