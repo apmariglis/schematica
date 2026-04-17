@@ -24,7 +24,10 @@ Both expose the same interface so the agent loop is backend-agnostic:
 from __future__ import annotations
 
 import json
+import warnings
 from types import SimpleNamespace
+
+_empty_response_count = 0  # incremented each time the API returns empty choices
 
 
 def _try_int(val) -> int | None:
@@ -35,6 +38,34 @@ def _try_int(val) -> int | None:
         return int(val)
     except (ValueError, TypeError):
         return None
+
+
+def _write_empty_response_dump(
+    n: int,
+    model: str,
+    system: str,
+    messages: list,
+    tools: list,
+    prompt_tokens: int | None,
+) -> None:
+    """Write the full LiteLLM request to debug_empty_N.json for post-mortem inspection.
+
+    A new numbered file is created for each empty response so every occurrence
+    is preserved even when the model recovers after a nudge and later fails again.
+    """
+    path = f"debug_empty_{n}.json"
+    payload = {
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "system": system,
+        "messages": messages,
+        "tools": tools,
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+    except Exception as exc:
+        warnings.warn(f"Could not write empty-response dump to {path}: {exc}", UserWarning, stacklevel=2)
 
 
 class _AnthropicBackend:
@@ -83,6 +114,7 @@ class _AnthropicBackend:
             "output_tokens":         getattr(u, "output_tokens",               0),
             "cache_creation_tokens": getattr(u, "cache_creation_input_tokens", 0),
             "cache_read_tokens":     getattr(u, "cache_read_input_tokens",     0),
+            "thinking_tokens":       0,
         }
 
     def stop_reason(self, response) -> str:
@@ -185,10 +217,39 @@ class _LiteLLMBackend:
             max_tokens=max_tokens,
         )
         if not response.choices:
-            raise ValueError(
-                f"LiteLLM returned empty choices (model={self._model}). "
+            global _empty_response_count
+            _empty_response_count += 1
+            usage = getattr(response, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            output_tokens = getattr(usage, "completion_tokens", None)
+            details = getattr(usage, "completion_tokens_details", None)
+            thinking_tokens = getattr(details, "reasoning_tokens", None)
+            _write_empty_response_dump(
+                n=_empty_response_count,
+                model=self._model,
+                system=self._system,
+                messages=self.messages,
+                tools=openai_tools,
+                prompt_tokens=prompt_tokens,
+            )
+            parts = []
+            if prompt_tokens is not None:
+                parts.append(f"prompt_tokens={prompt_tokens}")
+            if output_tokens is not None:
+                parts.append(f"output_tokens={output_tokens}")
+            if thinking_tokens is not None:
+                parts.append(f"thinking_tokens={thinking_tokens}")
+            token_info = (", " + ", ".join(parts)) if parts else ""
+            err = ValueError(
+                f"LiteLLM returned empty choices (model={self._model}{token_info}). "
                 "This usually means the response was filtered or the provider returned an error."
             )
+            err.empty_response_tokens = {
+                "prompt_tokens":   prompt_tokens,
+                "output_tokens":   output_tokens,
+                "thinking_tokens": thinking_tokens,
+            }
+            raise err
         return response
 
     def last_output_rate_limit(self) -> dict:
@@ -197,11 +258,14 @@ class _LiteLLMBackend:
 
     def extract_usage(self, response) -> dict:
         u = response.usage
+        details = getattr(u, "completion_tokens_details", None)
+        thinking_tokens = getattr(details, "reasoning_tokens", 0) or 0
         return {
             "input_tokens":          getattr(u, "prompt_tokens",     0),
             "output_tokens":         getattr(u, "completion_tokens", 0),
             "cache_creation_tokens": 0,
             "cache_read_tokens":     0,
+            "thinking_tokens":       thinking_tokens,
         }
 
     def _choice(self, response):
