@@ -133,6 +133,49 @@ def test_context_fill_without_cache_unchanged():
     assert "10.0%" in result
 
 
+# ── average context % includes session cache tokens ───────────────────────────
+
+def _avg_content_line(result: str) -> str:
+    """Return the content line that follows the averages section header."""
+    lines = result.splitlines()
+    for i, line in enumerate(lines):
+        if "averages over all completed iterations" in line:
+            return lines[i + 1]
+    raise AssertionError("averages section not found in output")
+
+
+def test_avg_context_fill_includes_session_cache_read_tokens():
+    # 2 fresh + 49,998 cached = 50,000 effective per iter in 200,000 window → 25.0%
+    tracker = _RequestTracker(started_at=0.0)
+    tracker.record(now=5.0)
+    result = _format_iter_stats(
+        2, 100, "test-model", _MOCK_PRICING,
+        all_iters=1,
+        session_tracker=tracker, now=5.0,
+        session_total_in=2, session_total_out=100,
+        session_total_cost=0.0,
+        session_total_cache_read=49_998,
+        context_window=200_000,
+    )
+    assert "25.0%" in _avg_content_line(result)
+
+
+def test_avg_context_fill_includes_session_cache_creation_tokens():
+    # 1,000 fresh + 49,000 cache_write = 50,000 effective per iter in 200,000 window → 25.0%
+    tracker = _RequestTracker(started_at=0.0)
+    tracker.record(now=5.0)
+    result = _format_iter_stats(
+        1_000, 100, "test-model", _MOCK_PRICING,
+        all_iters=1,
+        session_tracker=tracker, now=5.0,
+        session_total_in=1_000, session_total_out=100,
+        session_total_cost=0.0,
+        session_total_cache_create=49_000,
+        context_window=200_000,
+    )
+    assert "25.0%" in _avg_content_line(result)
+
+
 # ── box lines still have equal width with cache tokens ─────────────────────────
 
 def test_all_box_lines_equal_width_with_cache_tokens():
@@ -141,8 +184,7 @@ def test_all_box_lines_equal_width_with_cache_tokens():
     result = _format_iter_stats(
         2, 710, "test-model", _MOCK_PRICING,
         cache_read_tokens=51_234,
-        phase_label="1", phase_n=1, phase_elapsed=10.0,
-        phase_total_in=2, phase_total_out=710, phase_total_cost=0.0036,
+        all_iters=1,
         session_tracker=tracker, now=10.0,
         session_total_in=2, session_total_out=710,
         session_total_cost=0.0036,

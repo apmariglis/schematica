@@ -30,6 +30,7 @@ _PHASE3_WARN_LEGEND: dict[str, str] = {
     "date_mismatch":    "Actual data range falls outside the declared time_range — auto-patched below",
     "extra_cols":       "Query returns more than 2 columns — metrics must return exactly date + value",
     "period_boundary":  "time_range start/end does not align to the granularity boundary (e.g. monthly → first of month) — auto-patched below",
+    "constant_values":  "All periods return the same value — may indicate sparse/small source data or a SQL logic error (missing GROUP BY)",
 }
 
 
@@ -78,28 +79,27 @@ def _format_iter_stats(
     context_window: int = 0,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
-    # phase-level averages (shown when phase_n > 0)
-    phase_label: str = "",
-    phase_n: int = 0,
-    phase_elapsed: float = 0.0,
-    phase_total_in: int = 0,
-    phase_total_out: int = 0,
-    phase_total_cost: float = 0.0,
+    thinking_tokens: int = 0,
+    # averages over all completed iterations (shown when all_iters > 0)
+    all_iters: int = 0,
     # session totals (shown when session_tracker is provided)
     session_tracker: "_RequestTracker | None" = None,
     now: float = 0.0,
     session_total_in: int = 0,
     session_total_out: int = 0,
+    session_total_thinking: int = 0,
     session_total_cost: float = 0.0,
+    session_total_cache_create: int = 0,
+    session_total_cache_read: int = 0,
 ) -> str:
     """Return a box-formatted stats block printed between iterations.
 
     Sections (all optional except current iter):
       current iter    — per-call Tokens, cost, duration, context%
-      averages (phase X) — per-phase averages (phase_n > 0)
+      averages        — averages over all completed iterations (all_iters > 0)
       session         — cross-phase totals + llm calls/min (session_tracker provided)
 
-    Top border embeds "1 iter = 1 LLM call". Bottom border is plain.
+    Top border embeds "1 iter = 1 LLM call". Bottom border embeds llm calls/min when session is shown.
     """
     p = get_model_pricing(model, pricing)
     iter_cost = (in_tokens * p["input"] + out_tokens * p["output"]) / 1_000_000
@@ -120,6 +120,11 @@ def _format_iter_stats(
     effective_in = in_tokens + cache_creation_tokens + cache_read_tokens
     _fill = f"{_SEP}{effective_in / context_window * 100:.1f}% context" if context_window > 0 else ""
 
+    def _out_str(out: int, think: int) -> str:
+        if think:
+            return f"{out:,} out ({out - think:,} out/{think:,} think)"
+        return f"{out:,} out"
+
     _cache_parts = ""
     if cache_read_tokens:
         _cache_parts += f" | {cache_read_tokens:,} cached"
@@ -127,20 +132,24 @@ def _format_iter_stats(
         _cache_parts += f" | {cache_creation_tokens:,} cache↑"
 
     iter_content = (
-        f"  Tokens: {in_tokens:,} in | {out_tokens:,} out{_cache_parts}"
+        f"  Tokens: {in_tokens:,} in | {_out_str(out_tokens, thinking_tokens)}{_cache_parts}"
         f"{_SEP}${iter_cost:.4f}{_SEP}{_fmt_dur(iter_duration)}{_fill}  "
     )
 
-    # ── phase averages content ────────────────────────────────────────────────
-    show_averages = phase_n > 0
+    # ── averages over all completed iterations ────────────────────────────────
+    show_averages = all_iters > 0
     if show_averages:
-        avg_in   = phase_total_in  // phase_n
-        avg_out  = phase_total_out // phase_n
-        avg_cost = phase_total_cost / phase_n
-        avg_dur  = phase_elapsed   / phase_n
+        avg_in       = session_total_in       // all_iters
+        avg_out      = session_total_out      // all_iters
+        avg_thinking = session_total_thinking // all_iters
+        avg_cost     = session_total_cost     / all_iters
+        _total_elapsed = (now - session_tracker._started_at) if session_tracker is not None else 0.0
+        avg_dur      = _total_elapsed / all_iters
+        avg_effective_in = avg_in + (session_total_cache_create + session_total_cache_read) // all_iters
+        _avg_fill = f"{_SEP}{avg_effective_in / context_window * 100:.1f}% context" if context_window > 0 else ""
         avg_content = (
-            f"  Tokens: {avg_in:,} in | {avg_out:,} out"
-            f"{_SEP}${avg_cost:.4f}{_SEP}{_fmt_dur(avg_dur)}  "
+            f"  Tokens: {avg_in:,} in | {_out_str(avg_out, avg_thinking)}"
+            f"{_SEP}${avg_cost:.4f}{_SEP}{_fmt_dur(avg_dur)}{_avg_fill}  "
         )
 
     # ── session totals content ────────────────────────────────────────────────
@@ -149,24 +158,17 @@ def _format_iter_stats(
         session_elapsed = now - session_tracker._started_at
         llm_calls_min   = session_tracker.rpm(now)
         session_content = (
-            f"  Tokens: {session_total_in:,} in | {session_total_out:,} out"
-            f"{_SEP}${session_total_cost:.4f}{_SEP}{_fmt_dur(session_elapsed)}"
-            f"{_SEP}{llm_calls_min:.1f} llm calls/min  "
+            f"  Tokens: {session_total_in:,} in | {_out_str(session_total_out, session_total_thinking)}"
+            f"{_SEP}${session_total_cost:.4f}{_SEP}{_fmt_dur(session_elapsed)}  "
         )
-
-    def _phase_display(label: str) -> str:
-        """'1 (exploration)' → 'phase 1 ─ exploration'"""
-        if " (" in label and label.endswith(")"):
-            num, rest = label.split(" (", 1)
-            return f"phase {num} ─ {rest[:-1]}"
-        return f"phase {label}"
 
     # ── section headers ───────────────────────────────────────────────────────
     _iter_label  = f"current iter {iter_num}/{max_iter}" if iter_num and max_iter else "current iter"
     _LEFT_TOP    = f"─ {_iter_label} "
     _RIGHT_TOP   = " 1 iter = 1 LLM call ─"
-    _AVG_HDR     = f"─ averages ({_phase_display(phase_label)}) " if phase_label else "─ averages "
+    _AVG_HDR     = "─ averages over all completed iterations "
     _SESSION_HDR = "─ session (accumulated) "
+    _BOTTOM_LABEL = f" approx. {llm_calls_min:.1f} llm calls/min " if show_session else ""
 
     # ── compute inner width ───────────────────────────────────────────────────
     min_top_w = len(_LEFT_TOP) + len(_RIGHT_TOP)
@@ -174,13 +176,18 @@ def _format_iter_stats(
     if show_averages:
         candidates += [len(avg_content), len(_AVG_HDR) + 2]
     if show_session:
-        candidates += [len(session_content), len(_SESSION_HDR) + 2]
+        candidates += [len(session_content), len(_SESSION_HDR) + 2, len(_BOTTOM_LABEL) + 4]
     inner_w = max(candidates)
 
     # ── build borders ─────────────────────────────────────────────────────────
     top_fill = inner_w - len(_LEFT_TOP) - len(_RIGHT_TOP)
     top    = "╭" + _LEFT_TOP + "─" * top_fill + _RIGHT_TOP + "╮"
-    bottom = "╰" + "─" * inner_w + "╯"
+    if _BOTTOM_LABEL:
+        _bot_left  = (inner_w - len(_BOTTOM_LABEL)) // 2
+        _bot_right = inner_w - len(_BOTTOM_LABEL) - _bot_left
+        bottom = "╰" + "─" * _bot_left + _BOTTOM_LABEL + "─" * _bot_right + "╯"
+    else:
+        bottom = "╰" + "─" * inner_w + "╯"
 
     def _mid(hdr: str) -> str:
         return "├" + hdr + "─" * (inner_w - len(hdr)) + "┤"
@@ -197,60 +204,6 @@ def _format_iter_stats(
     lines.append(bottom)
     return "\n".join(lines)
 
-
-def _format_completed_phases_box(phases: list[dict]) -> str:
-    """Return a box summarising all completed phases.
-
-    Each entry in `phases` must have keys:
-      label, n, elapsed, total_in, total_out, total_cost
-    """
-    def _fmt_dur(secs: float) -> str:
-        if secs < 60:
-            return f"{secs:.1f}s"
-        m, s = divmod(int(secs), 60)
-        return f"{m}m{s:02d}s"
-
-    def _phase_display(label: str) -> str:
-        if " (" in label and label.endswith(")"):
-            num, rest = label.split(" (", 1)
-            return f"phase {num} ─ {rest[:-1]}"
-        return f"phase {label}"
-
-    _SEP   = " · "
-    _TITLE = " complete phases "
-
-    rows: list[tuple[str, str]] = []
-    for ph in phases:
-        display = _phase_display(ph["label"])
-        n       = ph["n"]
-        avg_in   = ph["total_in"]  // n
-        avg_out  = ph["total_out"] // n
-        avg_cost = ph["total_cost"]  / n
-        avg_dur  = ph["elapsed"]     / n
-        content = (
-            f"  Tokens: {avg_in:,} in | {avg_out:,} out avg"
-            f"{_SEP}${avg_cost:.4f} avg{_SEP}{_fmt_dur(avg_dur)} avg{_SEP}{n} iters  "
-        )
-        rows.append((display, content))
-
-    phase_hdrs = [f"── {display} " for display, _ in rows]
-    inner_w = max(
-        len(_TITLE) + 4,
-        *(len(h) + 2 for h in phase_hdrs),
-        *(len(c)     for _, c in rows),
-    )
-
-    side  = (inner_w - len(_TITLE)) // 2
-    extra = inner_w - len(_TITLE) - side * 2
-    top   = "╭" + "─" * side + _TITLE + "─" * (side + extra) + "╮"
-
-    lines = [top]
-    for (display, content), hdr in zip(rows, phase_hdrs):
-        lines.append("├" + hdr + "─" * (inner_w - len(hdr)) + "┤")
-        lines.append(f"│{content.ljust(inner_w)}│")
-
-    lines.append("╰" + "─" * inner_w + "╯")
-    return "\n".join(lines)
 
 
 def _print_header(connection_string: str, out_path: str, model: str, cache: bool) -> None:

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from schematica.agent import _format_iter_stats, _format_completed_phases_box, _RequestTracker
+from schematica.agent import _format_iter_stats, _RequestTracker
 
 
 _MOCK_PRICING = {
@@ -49,6 +49,46 @@ def test_token_format_uses_tokens_label_and_pipe_separator():
     result = _format_iter_stats(1000, 500, "test-model", _MOCK_PRICING)
     assert "Tokens:" in result
     assert "in |" in result or "in|" in result
+
+
+# ── thinking tokens ───────────────────────────────────────────────────────────
+
+def test_thinking_tokens_shown_inline_with_out_when_nonzero():
+    # "500 out (300 out/200 think)" — non-think and think breakdown
+    result = _format_iter_stats(1000, 500, "test-model", _MOCK_PRICING, thinking_tokens=200)
+    assert "500 out (300 out/200 think)" in result
+
+
+def test_thinking_tokens_absent_when_zero():
+    result = _format_iter_stats(1000, 500, "test-model", _MOCK_PRICING, thinking_tokens=0)
+    assert "think" not in result
+
+
+def test_thinking_tokens_shown_in_averages_row():
+    # all_iters=2, session_total_out=1000, session_total_thinking=800 → avg: "500 out (100 out/400 think)"
+    tracker = _session_tracker(2, started_at=0.0, now=20.0)
+    result = _format_iter_stats(
+        1000, 500, "test-model", _MOCK_PRICING,
+        thinking_tokens=400,
+        all_iters=2,
+        session_tracker=tracker, now=20.0,
+        session_total_in=2000, session_total_out=1000, session_total_thinking=800, session_total_cost=0.002,
+    )
+    avg_line = result.splitlines()[3]
+    assert "100 out/400 think" in avg_line
+
+
+def test_thinking_tokens_shown_in_session_row():
+    # session_total_out=500, session_total_thinking=300 → "500 out (200 out/300 think)"
+    tracker = _session_tracker(1, started_at=0.0, now=10.0)
+    result = _format_iter_stats(
+        1000, 500, "test-model", _MOCK_PRICING,
+        thinking_tokens=300,
+        session_tracker=tracker, now=10.0,
+        session_total_out=500, session_total_thinking=300,
+    )
+    session_line = [l for l in result.splitlines() if "session" not in l and "in |" in l][-1]
+    assert "200 out/300 think" in session_line
 
 
 # ── cost ──────────────────────────────────────────────────────────────────────
@@ -131,12 +171,25 @@ def test_disclaimer_embedded_in_top_border():
     assert "1 iter" in top_line or "LLM call" in top_line
 
 
-def test_bottom_border_is_plain():
-    # Bottom border has no text embedded — just dashes
+def test_bottom_border_is_plain_without_session():
+    # Without a session tracker the bottom border is plain dashes
     result = _format_iter_stats(100, 50, "test-model", _MOCK_PRICING)
     bottom_line = result.splitlines()[-1]
     assert bottom_line.startswith("╰") and bottom_line.endswith("╯")
-    assert "iter" not in bottom_line and "LLM" not in bottom_line
+    assert "llm calls/min" not in bottom_line
+
+
+def test_bottom_border_embeds_llm_calls_per_min_with_session():
+    # With a session tracker the bottom border embeds "approx. X llm calls/min"
+    tracker = _session_tracker(2, started_at=0.0, now=60.0)
+    result = _format_iter_stats(
+        100, 50, "test-model", _MOCK_PRICING,
+        session_tracker=tracker, now=60.0,
+    )
+    bottom_line = result.splitlines()[-1]
+    assert bottom_line.startswith("╰") and bottom_line.endswith("╯")
+    assert "approx." in bottom_line
+    assert "llm calls/min" in bottom_line
 
 
 # ── session row (requires tracker) ────────────────────────────────────────────
@@ -186,17 +239,26 @@ def test_elapsed_time_appears_in_session_row():
     assert "45.0s" in result
 
 
-def test_llm_calls_per_min_appears_in_session_row():
-    # 3 calls over 60s → 3.0 llm calls/min
+def test_llm_calls_per_min_appears_in_bottom_border():
+    # 3 calls over 60s → 3.0 llm calls/min — shown in bottom border, not session content
     tracker = _session_tracker(3, started_at=0.0, now=60.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
         session_tracker=tracker, now=60.0,
-        phase_n=3, phase_elapsed=60.0,
-        phase_total_in=300, phase_total_out=150,
     )
-    session_line = result.splitlines()[5]  # [0]=top,[1]=iter,[2]=avg hdr,[3]=avg,[4]=session hdr,[5]=session
-    assert "3.0 llm calls/min" in session_line
+    bottom_line = result.splitlines()[-1]
+    assert "3.0 llm calls/min" in bottom_line
+
+
+def test_llm_calls_per_min_not_in_session_content_row():
+    # llm calls/min moved to bottom border — must not appear in the session content row
+    tracker = _session_tracker(3, started_at=0.0, now=60.0)
+    result = _format_iter_stats(
+        100, 50, "test-model", _MOCK_PRICING,
+        session_tracker=tracker, now=60.0,
+    )
+    session_content_line = result.splitlines()[3]  # [0]=top,[1]=iter,[2]=session hdr,[3]=session
+    assert "llm calls/min" not in session_content_line
 
 
 def test_llm_calls_per_min_not_iter_per_min():
@@ -231,6 +293,32 @@ def test_context_fill_pct_absent_when_context_window_not_provided():
     assert "%" not in result
 
 
+def test_avg_context_fill_pct_appears_in_averages_row():
+    # session_total_in=1000, all_iters=2 → avg_in=500, context_window=10000 → 5.0%
+    tracker = _session_tracker(2, started_at=0.0, now=20.0)
+    result = _format_iter_stats(
+        1000, 50, "test-model", _MOCK_PRICING,
+        context_window=10_000,
+        all_iters=2,
+        session_tracker=tracker, now=20.0,
+        session_total_in=1000, session_total_out=100, session_total_cost=0.0002,
+    )
+    avg_line = result.splitlines()[3]
+    assert "5.0% context" in avg_line
+
+
+def test_avg_context_fill_pct_absent_without_context_window():
+    tracker = _session_tracker(2, started_at=0.0, now=20.0)
+    result = _format_iter_stats(
+        100, 50, "test-model", _MOCK_PRICING,
+        all_iters=2,
+        session_tracker=tracker, now=20.0,
+        session_total_in=200, session_total_out=100, session_total_cost=0.0002,
+    )
+    avg_line = result.splitlines()[3]
+    assert "%" not in avg_line
+
+
 def test_context_fill_uses_word_context():
     result = _format_iter_stats(
         10_000, 200, "test-model", _MOCK_PRICING,
@@ -257,75 +345,84 @@ def test_context_fill_pct_rounds_to_one_decimal():
     assert "33.3%" in result
 
 
-# ── averages row (phase-level, resets per phase) ───────────────────────────────
+# ── averages row (all completed iterations) ────────────────────────────────────
 
-def test_averages_row_absent_without_phase_data():
-    # phase_n=0 (default) → no averages section
+def test_averages_row_absent_without_all_iters():
+    # all_iters=0 (default) → no averages section
     result = _format_iter_stats(100, 50, "test-model", _MOCK_PRICING)
     assert "averages" not in result
 
 
-def test_averages_row_present_when_phase_n_provided():
+def test_averages_row_present_when_all_iters_provided():
+    tracker = _session_tracker(2, started_at=0.0, now=20.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1 (exploration)",
-        phase_n=2, phase_elapsed=20.0,
-        phase_total_in=200, phase_total_out=100, phase_total_cost=0.0004,
+        all_iters=2,
+        session_tracker=tracker, now=20.0,
+        session_total_in=200, session_total_out=100, session_total_cost=0.0004,
     )
     assert "averages" in result
 
 
-def test_averages_row_includes_phase_label():
-    # "1 (exploration)" is rendered as "phase 1 ─ exploration"
+def test_averages_header_says_all_completed_iterations():
+    tracker = _session_tracker(1, started_at=0.0, now=10.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1 (exploration)",
-        phase_n=1, phase_elapsed=10.0,
-        phase_total_in=100, phase_total_out=50, phase_total_cost=0.0002,
+        all_iters=1,
+        session_tracker=tracker, now=10.0,
+        session_total_in=100, session_total_out=50, session_total_cost=0.0002,
     )
-    assert "phase 1" in result
-    assert "exploration" in result
+    avg_hdr_line = result.splitlines()[2]
+    assert "all completed iterations" in avg_hdr_line
 
 
 def test_averages_row_shows_avg_input_tokens():
-    # phase_n=2, phase_total_in=1000 → avg 500 in
+    # all_iters=2, session_total_in=1000 → avg 500 in
+    tracker = _session_tracker(2, started_at=0.0, now=20.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1", phase_n=2, phase_elapsed=20.0,
-        phase_total_in=1000, phase_total_out=200, phase_total_cost=0.0010,
+        all_iters=2,
+        session_tracker=tracker, now=20.0,
+        session_total_in=1000, session_total_out=200, session_total_cost=0.0010,
     )
     avg_line = result.splitlines()[3]  # [0]=top,[1]=iter,[2]=avg hdr,[3]=avg content
     assert "500" in avg_line
 
 
 def test_averages_row_shows_avg_output_tokens():
-    # phase_n=4, phase_total_out=2000 → avg 500 out
+    # all_iters=4, session_total_out=2000 → avg 500 out
+    tracker = _session_tracker(4, started_at=0.0, now=40.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1", phase_n=4, phase_elapsed=40.0,
-        phase_total_in=400, phase_total_out=2000, phase_total_cost=0.0008,
+        all_iters=4,
+        session_tracker=tracker, now=40.0,
+        session_total_in=400, session_total_out=2000, session_total_cost=0.0008,
     )
     avg_line = result.splitlines()[3]
     assert "500" in avg_line
 
 
 def test_averages_row_shows_avg_cost():
-    # phase_n=2, phase_total_cost=0.0100 → avg $0.0050
+    # all_iters=2, session_total_cost=0.0100 → avg $0.0050
+    tracker = _session_tracker(2, started_at=0.0, now=20.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1", phase_n=2, phase_elapsed=20.0,
-        phase_total_in=200, phase_total_out=100, phase_total_cost=0.0100,
+        all_iters=2,
+        session_tracker=tracker, now=20.0,
+        session_total_in=200, session_total_out=100, session_total_cost=0.0100,
     )
     avg_line = result.splitlines()[3]
     assert "0.0050" in avg_line
 
 
 def test_averages_row_shows_avg_duration():
-    # phase_n=2, phase_elapsed=10.0 → avg 5.0s
+    # all_iters=2, elapsed=10.0s → avg 5.0s
+    tracker = _session_tracker(2, started_at=0.0, now=10.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1", phase_n=2, phase_elapsed=10.0,
-        phase_total_in=200, phase_total_out=100, phase_total_cost=0.0004,
+        all_iters=2,
+        session_tracker=tracker, now=10.0,
+        session_total_in=200, session_total_out=100, session_total_cost=0.0004,
     )
     avg_line = result.splitlines()[3]
     assert "5.0s" in avg_line
@@ -381,24 +478,24 @@ def test_box_has_5_lines_with_session_only():
     assert len(result.splitlines()) == 5
 
 
-def test_box_has_5_lines_with_phase_only():
+def test_box_has_5_lines_with_averages_only():
     # top + iter + avg hdr + avg content + bottom
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1", phase_n=1, phase_elapsed=5.0,
-        phase_total_in=100, phase_total_out=50, phase_total_cost=0.0002,
+        all_iters=1,
+        session_total_in=100, session_total_out=50, session_total_cost=0.0002,
     )
     assert len(result.splitlines()) == 5
 
 
-def test_box_has_7_lines_with_both_phase_and_session():
+def test_box_has_7_lines_with_both_averages_and_session():
     # top + iter + avg hdr + avg + session hdr + session + bottom
     tracker = _session_tracker(1, started_at=0.0, now=10.0)
     result = _format_iter_stats(
         100, 50, "test-model", _MOCK_PRICING,
-        phase_label="1", phase_n=1, phase_elapsed=10.0,
-        phase_total_in=100, phase_total_out=50, phase_total_cost=0.0002,
+        all_iters=1,
         session_tracker=tracker, now=10.0,
+        session_total_in=100, session_total_out=50, session_total_cost=0.0002,
     )
     lines = result.splitlines()
     assert len(lines) == 7
@@ -412,72 +509,12 @@ def test_all_box_lines_have_equal_width_full_box():
     tracker = _session_tracker(3, started_at=0.0, now=90.0)
     result = _format_iter_stats(
         1500, 800, "test-model", _MOCK_PRICING,
-        phase_label="1 (exploration)", phase_n=3, phase_elapsed=90.0,
-        phase_total_in=4500, phase_total_out=2400, phase_total_cost=0.0089,
+        all_iters=3,
         session_tracker=tracker, now=90.0,
         session_total_in=4500, session_total_out=2400, session_total_cost=0.0089,
         iter_duration=12.5,
     )
     lines = result.splitlines()
     assert len(set(len(line) for line in lines)) == 1, (
-        f"Box lines have unequal widths: {[len(l) for l in lines]}"
-    )
-
-
-# ── _format_completed_phases_box ──────────────────────────────────────────────
-
-_PHASE1 = {"label": "1 (exploration)",    "n": 16, "elapsed": 96.0,  "total_in": 172_221, "total_out": 22_264, "total_cost": 0.1073}
-_PHASE2 = {"label": "2 (documentation)", "n":  4, "elapsed": 24.0,  "total_in":  43_052, "total_out":  5_566, "total_cost": 0.0268}
-
-
-def test_completed_phases_box_returns_string():
-    result = _format_completed_phases_box([_PHASE1])
-    assert isinstance(result, str)
-
-
-def test_completed_phases_box_shows_complete_phases_title():
-    result = _format_completed_phases_box([_PHASE1])
-    assert "complete phases" in result
-
-
-def test_completed_phases_box_shows_phase_label():
-    # "1 (exploration)" → "phase 1 ─ exploration"
-    result = _format_completed_phases_box([_PHASE1])
-    assert "phase 1" in result
-    assert "exploration" in result
-
-
-def test_completed_phases_box_shows_avg_tokens():
-    # phase_n=2, total_in=1000 → avg 500
-    phase = {"label": "1", "n": 2, "elapsed": 20.0, "total_in": 1000, "total_out": 200, "total_cost": 0.0010}
-    result = _format_completed_phases_box([phase])
-    assert "500" in result
-
-
-def test_completed_phases_box_shows_avg_cost():
-    # phase_n=4, total_cost=0.0200 → avg $0.0050
-    phase = {"label": "1", "n": 4, "elapsed": 40.0, "total_in": 400, "total_out": 200, "total_cost": 0.0200}
-    result = _format_completed_phases_box([phase])
-    assert "0.0050" in result
-
-
-def test_completed_phases_box_shows_iter_count():
-    phase = {"label": "1", "n": 31, "elapsed": 300.0, "total_in": 31000, "total_out": 3100, "total_cost": 0.0370}
-    result = _format_completed_phases_box([phase])
-    assert "31" in result
-
-
-def test_completed_phases_box_shows_all_phases():
-    result = _format_completed_phases_box([_PHASE1, _PHASE2])
-    assert "phase 1" in result
-    assert "phase 2" in result
-    assert "exploration" in result
-    assert "documentation" in result
-
-
-def test_completed_phases_box_all_lines_equal_width():
-    result = _format_completed_phases_box([_PHASE1, _PHASE2])
-    lines = result.splitlines()
-    assert len(set(len(l) for l in lines)) == 1, (
         f"Box lines have unequal widths: {[len(l) for l in lines]}"
     )
