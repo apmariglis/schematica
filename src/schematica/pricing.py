@@ -78,7 +78,10 @@ def _fetch_from_litellm(url: str, timeout: int) -> dict | None:
                 pricing[model_id] = entry
             max_input = info.get("max_input_tokens")
             if max_input is not None:
-                context_windows[model_id] = int(max_input)
+                try:
+                    context_windows[model_id] = int(max_input)
+                except (ValueError, TypeError):
+                    pass  # sample_spec has a doc string here, not a number
         if not pricing:
             return None
         return {"pricing": pricing, "context_windows": context_windows}

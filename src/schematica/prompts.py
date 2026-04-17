@@ -194,6 +194,13 @@ For each issue you are given:
   date column. This is a point-in-time snapshot, not a time-series. Move it to \
   queryable_facts and remove it from measurable_metrics. Do NOT wrap it in a \
   dummy date — that produces fake data.
+- constant_values: Every period returns the same value (value_min == value_max). \
+  Run a query to verify the SQL is correct. If the SQL is correct and the source \
+  table is genuinely small or sparse (e.g. only a handful of events total), the \
+  constant output is real data — keep the metric and record an explanation in \
+  agent_notes (e.g. "Only 18 rows in source table; all months show 1-2 events"). \
+  Only remove or rewrite the metric if there is a clear SQL logic error — for \
+  example a missing GROUP BY that causes every row to repeat the same aggregate.
 
 Submit the COMPLETE corrected catalogue via finish_catalogue — include all \
 metrics (fixed and unchanged), not just the ones you fixed. Remove only metrics \

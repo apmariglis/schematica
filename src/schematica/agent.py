@@ -37,8 +37,10 @@ from sqlalchemy import text
 from schematica.backends import _AnthropicBackend
 from schematica.backends import _LiteLLMBackend
 from schematica.catalogue import DataCatalogue
+from schematica.catalogue import KeyTerm
 from schematica.catalogue import MeasurableMetric
 from schematica.catalogue import QueryableFact
+from schematica.catalogue import TableRelationship
 from schematica.catalogue import TimeRange
 from schematica.db import make_readonly_engine
 from schematica.db import prompt_readonly_confirmation
@@ -50,7 +52,6 @@ from schematica.introspect import render_as_text
 from schematica.output import _PHASE3_WARN_LEGEND
 from schematica.output import _calc_rpm
 from schematica.output import _format_iter_stats
-from schematica.output import _format_completed_phases_box
 from schematica.output import _print_finish_catalogue
 from schematica.output import _print_header
 from schematica.output import _print_query
@@ -494,11 +495,11 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
         "output_tokens": 0,
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
+        "thinking_tokens": 0,
         "total_cost": 0.0,
     }
     started_at = time.monotonic()
     req_tracker = _RequestTracker(started_at)
-    completed_phases: list[dict] = []
     try:
         catalogue_data = _agent_loop(
             schema_text,
@@ -511,7 +512,6 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
             lookup_tables,
             started_at,
             req_tracker,
-            completed_phases,
         )
     except Exception as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
@@ -551,7 +551,6 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
             usage,
             table_columns,
             tracker=req_tracker,
-            completed_phases=completed_phases,
         )
     )
     _write_output(catalogue, out_path)
@@ -568,22 +567,144 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
     return catalogue
 
 
+def _pre_validate_catalogue_items(data: dict) -> list[str]:
+    """Pre-validate per-item fields in a finish_catalogue submission.
+
+    Returns a list of human-readable error strings. An empty list means all
+    items passed validation. Called before accepting the submission so errors
+    are returned to the agent as rejection feedback rather than crashing later
+    in _build_catalogue.
+    """
+    errors: list[str] = []
+
+    for idx, m in enumerate(data.get("measurable_metrics", [])):
+        if not isinstance(m, dict):
+            continue
+        try:
+            MeasurableMetric.model_validate(m)
+        except Exception as e:
+            errors.append(f"measurable_metrics[{idx}] ({m.get('name', '?')}): {e}")
+
+    for idx, f in enumerate(data.get("queryable_facts", [])):
+        if not isinstance(f, dict):
+            continue
+        try:
+            QueryableFact.model_validate(f)
+        except Exception as e:
+            errors.append(f"queryable_facts[{idx}] ({f.get('name', '?')}): {e}")
+
+    for idx, k in enumerate(data.get("key_terms", [])):
+        if not isinstance(k, dict):
+            continue
+        try:
+            KeyTerm.model_validate(k)
+        except Exception as e:
+            errors.append(f"key_terms[{idx}] ({k.get('term', '?')}): {e}")
+
+    for idx, r in enumerate(data.get("table_relationships", [])):
+        if not isinstance(r, dict):
+            continue
+        try:
+            TableRelationship.model_validate(r)
+        except Exception as e:
+            errors.append(f"table_relationships[{idx}]: {e}")
+
+    return errors
+
+
+def _compact_json(obj) -> str:
+    """Serialize *obj* to JSON without indentation for use in LLM prompts.
+
+    Compact serialization keeps token counts low. Use indent=2 only when writing
+    to disk or displaying to the user.
+    """
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def _debug_dump_conversation(backend) -> None:
+    """Print the full conversation history to stderr for debugging empty-response failures.
+
+    TODO: remove once the Gemini empty-response root cause is identified.
+    """
+    import sys
+    sep = "=" * 80
+    print(f"\n{sep}\nDEBUG CONVERSATION DUMP\n{sep}", file=sys.stderr)
+    system = getattr(backend, "_system", "<unavailable>")
+    messages = getattr(backend, "messages", [])
+    print(f"[SYSTEM]\n{system}\n", file=sys.stderr)
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        parts: list[str] = []
+
+        # ── text content (string or Anthropic content-block list) ─────────────
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            if content:
+                parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    parts.append(str(block)[:300])
+                    continue
+                btype = block.get("type", "?")
+                if btype == "text":
+                    parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    # Anthropic-format tool call
+                    raw = json.dumps(block.get("input", {}))
+                    parts.append(f"[tool_use: {block.get('name')} input={raw[:300]}]")
+                elif btype == "tool_result":
+                    c = block.get("content", "")
+                    if isinstance(c, list):
+                        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+                    parts.append(f"[tool_result id={block.get('tool_use_id')} {str(c)[:300]}]")
+                else:
+                    parts.append(f"[{btype}]")
+
+        # ── LiteLLM/OpenAI-format tool calls (separate field on assistant msg) ─
+        for tc in msg.get("tool_calls", []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", {})
+            name = fn.get("name", "?")
+            args_raw = fn.get("arguments", "{}")
+            try:
+                args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            except (json.JSONDecodeError, TypeError):
+                args = args_raw
+            # Show the most useful fields for run_query / finish_catalogue
+            if name == "run_query":
+                sql = str(args.get("sql", ""))[:200]
+                reason = args.get("reason", "")
+                parts.append(f"[tool_call: run_query sql={sql!r} reason={reason!r}]")
+            elif name == "finish_catalogue":
+                n_metrics = len(args.get("measurable_metrics", []))
+                n_facts = len(args.get("queryable_facts", []))
+                parts.append(
+                    f"[tool_call: finish_catalogue metrics={n_metrics} facts={n_facts}]"
+                )
+            else:
+                parts.append(f"[tool_call: {name} args={json.dumps(args)[:200]}]")
+
+        body = "\n".join(parts) if parts else "<empty>"
+        print(f"[{i}] {role.upper()}\n{body}\n", file=sys.stderr)
+    print(sep, file=sys.stderr)
+
+
 def _call_with_retry(
-    backend, tools: list, max_tokens: int = _MAX_OUTPUT_TOKENS, max_attempts: int = 7
+    backend, tools: list, max_tokens: int = _MAX_OUTPUT_TOKENS, max_attempts: int = 7,
 ):
     """Call backend.call() with backoff on rate-limit errors.
 
     Uses the retry-after header hint from the exception when available (exact
     wait the API requested).  Falls back to exponential backoff otherwise.
 
-    Empty-choices responses (API content-policy refusal) are handled separately:
-    one nudge message is appended and the call is retried once without sleeping.
-    A second consecutive empty-choices raises immediately.
+    Empty-choices responses are re-raised immediately so the caller (_run_phase)
+    can surface them as their own numbered iteration before retrying.
     """
     delay = (
         65  # starting own-backoff; 65s clears a 60s rate-limit window on first retry
     )
-    empty_choices_count = 0
     for attempt in range(1, max_attempts + 1):
         try:
             return backend.call(tools, max_tokens)
@@ -598,26 +719,8 @@ def _call_with_retry(
                     "Choose a model with function/tool calling support "
                     "(e.g. gemini/gemini-2.5-flash, anthropic/claude-sonnet-4-6)."
                 ) from exc
-            is_empty_choices = "empty choices" in msg
-            if is_empty_choices:
-                empty_choices_count += 1
-                if empty_choices_count >= 2:
-                    raise RuntimeError(
-                        "Model returned an empty response twice in a row "
-                        "(empty choices — API content-policy filter). "
-                        "The conversation context may have triggered a safety filter. "
-                        "Try a different model or database."
-                    ) from exc
-                console.print(
-                    "[yellow]  Empty response from API (possible content filter) — "
-                    "nudging and retrying[/yellow]"
-                )
-                backend.append_user(
-                    "Your previous response was empty — the API returned no content. "
-                    "Please continue: call run_query to explore the database further, "
-                    "or call finish_catalogue if you have enough data."
-                )
-                continue  # retry immediately, no sleep
+            if "empty choices" in msg:
+                raise  # handled by _run_phase as a new iteration
             is_rate_limit = (
                 "rate limit" in msg
                 or "ratelimit" in msg
@@ -680,7 +783,6 @@ def _agent_loop(
     lookup_tables: set[str] | None = None,
     started_at: float = 0.0,
     tracker: "_RequestTracker | None" = None,
-    completed_phases: "list[dict] | None" = None,
 ) -> dict:
     initial_message = (
         f"Here is the complete schema snapshot of the database:\n\n"
@@ -708,7 +810,6 @@ def _agent_loop(
         fk_pairs=fk_pairs,
         lookup_tables=lookup_tables,
         tracker=tracker,
-        completed_phases=completed_phases,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -751,7 +852,6 @@ def _agent_loop(
         usage=usage,
         table_columns=table_columns,
         tracker=tracker,
-        completed_phases=completed_phases,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -771,7 +871,7 @@ def _run_phase(
     fk_pairs: list[tuple[str, str]] | None = None,
     lookup_tables: set[str] | None = None,
     tracker: "_RequestTracker | None" = None,
-    completed_phases: "list[dict] | None" = None,
+    nudge_text: str | None = None,
 ) -> tuple[dict | None, list, int]:
     """Run one phase of the agent loop. Returns (catalogue_data, last_rejection_reasons, iterations_run)."""
 
@@ -782,47 +882,14 @@ def _run_phase(
     )
     last_out_tokens: int = 0  # previous iteration's output; used as estimate
 
-    # Per-phase tracking — resets each time _run_phase is called.
-    phase_start = time.monotonic()
-    phase_in: int = 0
-    phase_out: int = 0
-    phase_cost: float = 0.0
-    phase_n: int = 0
-
-    _phases = completed_phases if completed_phases is not None else []
-
-    def _flush_stats(stats: str) -> None:
-        """Print pending stats box, then update the completed phases box."""
-        if stats:
-            for line in stats.splitlines():
-                console.print(f"[dim]  {line}[/dim]")
-            console.print()
-        if phase_n > 0:
-            _phases.append({
-                "label":      phase_label,
-                "n":          phase_n,
-                "elapsed":    time.monotonic() - phase_start,
-                "total_in":   phase_in,
-                "total_out":  phase_out,
-                "total_cost": phase_cost,
-            })
-            box = _format_completed_phases_box(_phases)
-            for line in box.splitlines():
-                console.print(f"[dim]  {line}[/dim]")
-            console.print()
-
     last_rejection_reasons: list[str] = []
     fk_rejection_counts: dict = {}
     fk_waived: set = set()
-    prev_stats: str = ""
+    _current_max_tokens: int = _MAX_OUTPUT_TOKENS
+    _consecutive_empty: int = 0
     for i in range(1, max_iter + 1):
         rejection_reasons: list[str] = []
-        if prev_stats:
-            for line in prev_stats.splitlines():
-                console.print(f"[dim]  {line}[/dim]")
-            console.print()
-            prev_stats = ""
-        console.print(f"[dim]  Phase {phase_label} — iteration {i}/{max_iter}…[/dim]")
+        console.rule(f"[dim] Phase {phase_label} — iter {i}/{max_iter} [/dim]", style="dim", characters="━")
 
         call_start = time.monotonic()
         if output_bucket is not None:
@@ -835,7 +902,78 @@ def _run_phase(
                     f"(proactive throttle)[/yellow]"
                 )
 
-        response = _call_with_retry(backend, tools)
+        try:
+            response = _call_with_retry(backend, tools, max_tokens=_current_max_tokens)
+            _consecutive_empty = 0
+        except ValueError as exc:
+            if "empty choices" not in str(exc).lower():
+                raise
+            _consecutive_empty += 1
+            _et = getattr(exc, "empty_response_tokens", {})
+            _tok_parts = []
+            if _et.get("prompt_tokens") is not None:
+                _tok_parts.append(f"prompt={_et['prompt_tokens']:,}")
+            if _et.get("output_tokens") is not None:
+                _tok_parts.append(f"output={_et['output_tokens']:,}")
+            if _et.get("thinking_tokens") is not None:
+                _tok_parts.append(f"think={_et['thinking_tokens']:,}")
+            _tok_str = f"  [{', '.join(_tok_parts)}]" if _tok_parts else ""
+            if _consecutive_empty >= 2:
+                raise RuntimeError(
+                    "Model returned an empty response twice in a row "
+                    "(empty choices — API content-policy filter). "
+                    "The conversation context may have triggered a safety filter. "
+                    f"Try a different model or database.{_tok_str}"
+                ) from exc
+            # Account for tokens consumed by the empty response.
+            _empty_now = time.monotonic()
+            _empty_duration = _empty_now - call_start
+            if tracker is not None:
+                tracker.record(now=_empty_now)
+            _empty_in  = _et.get("prompt_tokens")   or 0
+            _empty_out = _et.get("output_tokens")    or 0
+            _empty_think = _et.get("thinking_tokens") or 0
+            usage["input_tokens"]   += _empty_in
+            usage["output_tokens"]  += _empty_out
+            usage["thinking_tokens"] += _empty_think
+            _ep = get_model_pricing(_config.model)
+            _empty_cost = (_empty_in * _ep["input"] + _empty_out * _ep["output"]) / 1_000_000
+            usage["total_cost"] += _empty_cost
+            _empty_stats = _format_iter_stats(
+                _empty_in, _empty_out, _config.model,
+                iter_duration=_empty_duration,
+                iter_num=i,
+                max_iter=max_iter,
+                context_window=_context_window(_config.model),
+                thinking_tokens=_empty_think,
+                all_iters=tracker.total if tracker is not None else i,
+                session_tracker=tracker,
+                now=_empty_now,
+                session_total_in=usage.get("input_tokens", 0),
+                session_total_out=usage.get("output_tokens", 0),
+                session_total_thinking=usage.get("thinking_tokens", 0),
+                session_total_cost=usage["total_cost"],
+                session_total_cache_create=usage.get("cache_creation_tokens", 0),
+                session_total_cache_read=usage.get("cache_read_tokens", 0),
+            )
+            for _line in _empty_stats.splitlines():
+                console.print(f"[dim]  {_line}[/dim]")
+            console.print()
+            # Double the output budget before retrying. Gemini 2.5 Flash's
+            # dynamic thinking can consume a large share of max_tokens,
+            # leaving too little for actual output.
+            _current_max_tokens = min(_current_max_tokens * 2, 65_536)
+            console.print(
+                f"[yellow]  Empty response from API — nudging and retrying "
+                f"(output budget raised to {_current_max_tokens:,} tokens)[/yellow]"
+            )
+            default_nudge = (
+                "Your previous response was empty — the API returned no content. "
+                "Please continue: call run_query to explore the database further, "
+                "or call finish_catalogue if you have enough data."
+            )
+            backend.append_user(nudge_text if nudge_text is not None else default_nudge)
+            continue  # this increments i, making the retry a new numbered iteration
         now = time.monotonic()
         iter_duration = now - call_start
 
@@ -850,6 +988,7 @@ def _run_phase(
         iter_out = iter_usage.get("output_tokens", 0)
         iter_cache_create = iter_usage.get("cache_creation_tokens", 0)
         iter_cache_read = iter_usage.get("cache_read_tokens", 0)
+        iter_thinking = iter_usage.get("thinking_tokens", 0)
 
         if output_bucket is not None:
             output_bucket.record(now=now, tokens=iter_out)
@@ -879,11 +1018,6 @@ def _run_phase(
             )
         usage["total_cost"] += iter_cost
 
-        phase_in   += iter_in
-        phase_out  += iter_out
-        phase_cost += iter_cost
-        phase_n    += 1
-
         _iter_stats = _format_iter_stats(
             iter_in,
             iter_out,
@@ -894,22 +1028,22 @@ def _run_phase(
             context_window=_context_window(_config.model),
             cache_creation_tokens=iter_cache_create,
             cache_read_tokens=iter_cache_read,
-            phase_label=phase_label,
-            phase_n=phase_n,
-            phase_elapsed=now - phase_start,
-            phase_total_in=phase_in,
-            phase_total_out=phase_out,
-            phase_total_cost=phase_cost,
+            thinking_tokens=iter_thinking,
+            all_iters=tracker.total if tracker is not None else i,
             session_tracker=tracker,
             now=now,
             session_total_in=usage.get("input_tokens", 0),
             session_total_out=usage.get("output_tokens", 0),
+            session_total_thinking=usage.get("thinking_tokens", 0),
             session_total_cost=usage["total_cost"],
+            session_total_cache_create=usage.get("cache_creation_tokens", 0),
+            session_total_cache_read=usage.get("cache_read_tokens", 0),
         )
-        if _phases:
-            prev_stats = _iter_stats + "\n\n" + _format_completed_phases_box(_phases)
-        else:
-            prev_stats = _iter_stats
+
+        def _print_iter_stats() -> None:
+            for line in _iter_stats.splitlines():
+                console.print(f"[dim]  {line}[/dim]")
+            console.print()
 
         backend.append_assistant(response)
 
@@ -935,6 +1069,7 @@ def _run_phase(
                     "(tables, measurable_metrics, queryable_facts, time_coverage, "
                     "data_quality_notes, description)."
                 )
+            _print_iter_stats()
             continue
 
         # Collect any tool_use blocks regardless of stop_reason
@@ -951,6 +1086,7 @@ def _run_phase(
                     "cross-table JOIN opportunities before calling finish_catalogue. "
                     f"You have used {i}/{max_iter} iterations; minimum required is {min_iter}."
                 )
+                _print_iter_stats()
                 continue
             if i < max_iter:
                 # Past the minimum but haven't submitted yet — nudge to finish
@@ -962,10 +1098,12 @@ def _run_phase(
                     "you have learned. Include all tables, measurable_metrics, queryable_facts, "
                     "time_coverage, data_quality_notes, description, and overview."
                 )
+                _print_iter_stats()
                 continue
             console.print(
                 f"[yellow]  Agent produced no tool calls in phase {phase_label}[/yellow]"
             )
+            _print_iter_stats()
             return None, last_rejection_reasons, i
 
         # Process all tool_use blocks and collect results as (tool_id, content) pairs
@@ -1103,28 +1241,10 @@ def _run_phase(
                         rejection_reasons.append(
                             _FK_REJECTION_MSG.format(pairs_str=pairs_str)
                         )
-                # Pre-validate metrics and facts against the Pydantic schema so
-                # validation errors are returned to the agent rather than crashing.
+                # Pre-validate all per-item fields so errors are returned to the
+                # agent as rejection feedback rather than crashing in _build_catalogue.
                 if not rejection_reasons:
-                    schema_errors = []
-                    for idx, m in enumerate(block.input.get("measurable_metrics", [])):
-                        if not isinstance(m, dict):
-                            continue
-                        try:
-                            MeasurableMetric.model_validate(m)
-                        except Exception as e:
-                            schema_errors.append(
-                                f"measurable_metrics[{idx}] ({m.get('name', '?')}): {e}"
-                            )
-                    for idx, f in enumerate(block.input.get("queryable_facts", [])):
-                        if not isinstance(f, dict):
-                            continue
-                        try:
-                            QueryableFact.model_validate(f)
-                        except Exception as e:
-                            schema_errors.append(
-                                f"queryable_facts[{idx}] ({f.get('name', '?')}): {e}"
-                            )
+                    schema_errors = _pre_validate_catalogue_items(block.input)
                     if schema_errors:
                         rejection_reasons.append(
                             "Schema validation errors — fix these field values:\n  "
@@ -1208,13 +1328,15 @@ def _run_phase(
                         acceptance_msg = "Catalogue accepted."
                     pending_results.append((block.id, acceptance_msg))
 
+        # All tool output is done — print stats before state management
+        _print_iter_stats()
+
         # Always append tool_results to keep the message history valid
         backend.append_tool_results(pending_results)
         backend.compress_old_run_queries()
         last_out_tokens = iter_out
 
         if catalogue_data is not None:
-            _flush_stats(prev_stats)
             console.print(
                 f"[green]  finish_catalogue called in phase {phase_label}, iteration {i}.[/green]"
             )
@@ -1226,10 +1348,8 @@ def _run_phase(
 
         # If stop_reason was end_turn despite having tool_use blocks, exit phase
         if backend.stop_reason(response) == "end_turn":
-            _flush_stats(prev_stats)
             return None, last_rejection_reasons, i
 
-    _flush_stats(prev_stats)
     return None, last_rejection_reasons, max_iter
 
 
@@ -1673,7 +1793,6 @@ def _run_phase3(
     usage: dict,
     table_columns: dict,
     tracker: "_RequestTracker | None" = None,
-    completed_phases: "list[dict] | None" = None,
 ) -> tuple[DataCatalogue, list, list, list[str]]:
     """
     Evaluate the catalogue against the live database, patch trivial issues
@@ -1819,17 +1938,34 @@ def _run_phase3(
     # ── build refinement prompt ────────────────────────────────────────────────
     issues_text = ""
     for item, r in agent_issues:
+        is_metric = hasattr(item, "time_range")
+        kind = "METRIC" if is_metric else "FACT"
+        # Append evaluator measurements so the model can act without a confirmation query.
+        # For zero_rows it can immediately decide to remove; for constant_values it can
+        # see the value and row count and write notes directly.
+        result_detail = ""
+        v_min = getattr(r, "value_min", None)
+        v_max = getattr(r, "value_max", None)
+        if r.n_rows == 0:
+            result_detail = "  Eval result: 0 rows returned\n"
+        elif v_min is not None and v_min == v_max:
+            result_detail = (
+                f"  Eval result: {r.n_rows} row(s), all values = {v_min}"
+                f" (genuinely sparse — check if the source table is small)\n"
+            )
+        elif r.n_rows > 0:
+            result_detail = f"  Eval result: {r.n_rows} row(s) returned\n"
         issues_text += (
-            f"\n{'METRIC' if hasattr(item, 'time_range') else 'FACT'}: {item.name}\n"
+            f"\n{kind}: {item.name}\n"
             f"  Issue: {r.error}\n"
+            f"{result_detail}"
             f"  SQL: {item.sql}\n"
         )
 
-    current_catalogue_json = json.dumps(
+    current_catalogue_json = _compact_json(
         catalogue.model_copy(
             update={"measurable_metrics": list(patched_metrics.values())}
-        ).model_dump(),
-        indent=2,
+        ).model_dump()
     )
 
     refinement_prompt = (
@@ -1871,7 +2007,11 @@ def _run_phase3(
         usage=usage,
         table_columns=table_columns,
         tracker=tracker,
-        completed_phases=completed_phases,
+        nudge_text=(
+            "Your previous response was empty — the API returned no content. "
+            "Please continue: use run_query to investigate the reported issues, "
+            "then call finish_catalogue with the complete corrected catalogue."
+        ),
     )
 
     if refined_data is None:
