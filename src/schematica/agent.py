@@ -456,13 +456,9 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
         for fk in t.get("foreign_keys", [])
     ]
 
-    # Small tables (≤20 rows) are lookup/reference tables used to enrich other
-    # metrics — they don't need their own cross-table time-series metric.
-    _LOOKUP_ROW_THRESHOLD = 20
-
     # Pure junction tables (every column is a FK column, e.g. PlaylistTrack with
     # only PlaylistId and TrackId) have no temporal data and cannot produce a
-    # time-series metric on their own — exempt them too.
+    # time-series metric on their own — exempt them from metric requirements.
     _fk_cols_by_table: dict[str, set[str]] = {
         t["name"].lower(): {
             col.lower()
@@ -478,11 +474,21 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
         and cols == _fk_cols_by_table.get(t["name"].lower(), set())
     }
 
+    # Lookup tables: no date/time columns → reference/dimension data only.
+    # These are exempt from time-series metric requirements and FK cross-metric checks.
     lookup_tables: set[str] = {
         t["name"].lower()
         for t in snapshot["tables"]
-        if t.get("row_count", 0) <= _LOOKUP_ROW_THRESHOLD
+        if not _has_temporal_column(t)
     } | junction_tables
+
+    # Temporal tables: have at least one date/time column and are not lookup/junction.
+    # Every temporal table must appear in at least one measurable_metric.
+    required_tables: set[str] = {
+        t["name"].lower()
+        for t in snapshot["tables"]
+        if _has_temporal_column(t) and t["name"].lower() not in junction_tables
+    }
 
     engine = make_readonly_engine(connection_string)
     n_tables = len(snapshot["tables"])
@@ -514,6 +520,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
             lookup_tables,
             started_at,
             req_tracker,
+            required_tables=required_tables,
         )
     except Exception as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
@@ -1655,6 +1662,29 @@ def _run_queries_parallel(engine, run_query_blocks: list) -> list[tuple[str, str
 _NULL_RATE_THRESHOLD = 0.20  # columns with >= 20% nulls get a data quality note
 _SMALL_TABLE_ROWS    = 100   # tables with fewer rows than this get a size note
 
+# Date detection — used by _has_temporal_column and _deterministic_catalogue_fields.
+# Matches column type names (works for typed DBs) OR ISO-date-shaped min/max values
+# (SQLite stores dates as TEXT, so type matching alone misses them).
+_DATE_TYPE_HINTS = ("DATE", "TIME", "TIMESTAMP", "DATETIME")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _has_temporal_column(table: dict) -> bool:
+    """Return True if the table has at least one date/time column.
+
+    A column is considered temporal if its type name contains a date/time
+    keyword OR its min value looks like an ISO date string (YYYY-MM-DD).
+    The ISO-value check is needed for SQLite, which stores dates as TEXT.
+    """
+    for col in table.get("columns", []):
+        col_type = col.get("type", "").upper()
+        mn = col.get("stats", {}).get("min")
+        if any(h in col_type for h in _DATE_TYPE_HINTS):
+            return True
+        if isinstance(mn, str) and _ISO_DATE_RE.match(mn):
+            return True
+    return False
+
 
 def _deterministic_catalogue_fields(snapshot: dict) -> dict:
     """Compute catalogue fields that are fully determined by the schema snapshot.
@@ -1679,12 +1709,6 @@ def _deterministic_catalogue_fields(snapshot: dict) -> dict:
                 })
 
     # ── time_coverage ─────────────────────────────────────────────────────────
-    # Detect date columns by type name OR by ISO-date-shaped min/max values
-    # (SQLite stores dates as TEXT, so type-name matching alone misses them).
-    import re as _re
-    _iso_date_re = _re.compile(r"^\d{4}-\d{2}-\d{2}")
-    date_type_hints = ("DATE", "TIME", "TIMESTAMP", "DATETIME")
-
     all_mins: list[str] = []
     all_maxs: list[str] = []
     for tbl in snapshot["tables"]:
@@ -1692,10 +1716,8 @@ def _deterministic_catalogue_fields(snapshot: dict) -> dict:
             col_type = col.get("type", "").upper()
             stats = col.get("stats", {})
             mn, mx = stats.get("min"), stats.get("max")
-            type_is_date = any(h in col_type for h in date_type_hints)
-            value_looks_like_date = (
-                isinstance(mn, str) and _iso_date_re.match(mn)
-            )
+            type_is_date = any(h in col_type for h in _DATE_TYPE_HINTS)
+            value_looks_like_date = isinstance(mn, str) and bool(_ISO_DATE_RE.match(mn))
             if not (type_is_date or value_looks_like_date):
                 continue
             if mn:

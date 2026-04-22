@@ -56,6 +56,18 @@ When you are told exploration is complete, you will have only finish_catalogue \
 available. Compile everything you have learned and submit the catalogue. \
 You already have all the information you need from Phase 1.
 
+METRIC NAMING — every metric name must follow this pattern exactly:
+- Count/total:   "{Measure}"                e.g. "New Accounts", "Total MRR", "Support Tickets Opened"
+- Average:       "Average {Measure}"        e.g. "Average CSAT Score", "Average Resolution Hours"
+- Rate/ratio:    "{Measure} Rate"           e.g. "Churn Rate", "Ticket Escalation Rate"
+- Cumulative:    "Cumulative {Measure}"     e.g. "Cumulative Active Accounts"
+- Dimension split: "{Measure} ({Value})"   e.g. "New Accounts (APAC)", "Total MRR (Enterprise)"
+
+Rules for metric names: Title Case. No time period — granularity captures that. No table \
+name. Max 60 characters. When splitting across all values of a dimension, every split \
+metric uses the same base name with only the (Value) changing — e.g. "New Accounts (APAC)", \
+"New Accounts (EMEA)", "New Accounts (AMER)", "New Accounts (LATAM)".
+
 General rules:
 - The "overview" field is a multi-paragraph narrative (3–6 paragraphs, plain prose, \
   no bullet points) written for someone who has never seen this database before. It must cover: \
