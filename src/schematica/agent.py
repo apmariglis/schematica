@@ -66,6 +66,7 @@ from schematica.pricing import CACHE_READ_MULTIPLIER
 from schematica.pricing import CACHE_WRITE_MULTIPLIER
 from schematica.pricing import format_cost
 from schematica.pricing import get_context_window as _context_window
+from schematica.pricing import get_max_output_tokens as _get_max_output_tokens
 from schematica.pricing import get_model_pricing
 from sqlalchemy import inspect as sqla_inspect
 from schematica.prompts import _BARE_TABLES_ERROR_MSG
@@ -775,6 +776,16 @@ def _make_backend(
 
 _ENSEMBLE_RESULT_TRUNCATE = 800  # chars per query result in the combined context
 
+# Desired output-token budget for Phase-2/3 (documentation / refinement).
+# We want to give the agent as much room as possible to write a large catalogue,
+# but must not exceed the model's hard per-response limit.
+_PHASE2_TARGET_TOKENS = 65_536
+
+
+def _phase2_max_tokens() -> int:
+    """Phase-2/3 output token budget, capped by the active model's hard limit."""
+    return min(_PHASE2_TARGET_TOKENS, _get_max_output_tokens(_config.model))
+
 
 def _format_ensemble_context(schema_text: str, query_logs: list[list[dict]]) -> str:
     """Format N Phase-1 query logs into a single Phase-2 initial message.
@@ -904,7 +915,7 @@ def _agent_loop_ensemble(
         required_tables=required_tables,
         min_metrics=min_metrics,
         tracker=tracker,
-        initial_max_tokens=65_536,
+        initial_max_tokens=_phase2_max_tokens(),
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -1021,7 +1032,7 @@ def _agent_loop(
         required_tables=required_tables,
         min_metrics=min_metrics,
         tracker=tracker,
-        initial_max_tokens=65_536,
+        initial_max_tokens=_phase2_max_tokens(),
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -1141,7 +1152,7 @@ def _run_phase(
             # Double the output budget before retrying. Gemini 2.5 Flash's
             # dynamic thinking can consume a large share of max_tokens,
             # leaving too little for actual output.
-            _current_max_tokens = min(_current_max_tokens * 2, 65_536)
+            _current_max_tokens = min(_current_max_tokens * 2, _phase2_max_tokens())
             console.print(
                 f"[yellow]  Empty response from API — nudging and retrying "
                 f"(output budget raised to {_current_max_tokens:,} tokens)[/yellow]"
@@ -2346,7 +2357,7 @@ def _run_phase3(
         usage=usage,
         table_columns=table_columns,
         tracker=tracker,
-        initial_max_tokens=65_536,
+        initial_max_tokens=_phase2_max_tokens(),
         nudge_text=(
             "Your previous response was empty — the API returned no content. "
             "Please continue: use run_query to investigate the reported issues, "

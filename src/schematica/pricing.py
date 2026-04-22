@@ -50,15 +50,17 @@ _HARDCODED_FALLBACK: dict[str, dict] = {
 
 
 def _fetch_from_litellm(url: str, timeout: int) -> dict | None:
-    """Fetch LiteLLM's JSON and extract pricing + context windows in one pass.
+    """Fetch LiteLLM's JSON and extract pricing, context windows, and output limits.
 
-    Returns {"pricing": {...}, "context_windows": {...}} or None on failure.
+    Returns {"pricing": {...}, "context_windows": {...}, "output_token_limits": {...}}
+    or None on failure.
     """
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             raw = json.loads(resp.read().decode())
         pricing: dict = {}
         context_windows: dict = {}
+        output_token_limits: dict = {}
         for model_id, info in raw.items():
             if not isinstance(info, dict):
                 continue
@@ -82,9 +84,19 @@ def _fetch_from_litellm(url: str, timeout: int) -> dict | None:
                     context_windows[model_id] = int(max_input)
                 except (ValueError, TypeError):
                     pass  # sample_spec has a doc string here, not a number
+            max_output = info.get("max_output_tokens") or info.get("max_tokens")
+            if max_output is not None:
+                try:
+                    output_token_limits[model_id] = int(max_output)
+                except (ValueError, TypeError):
+                    pass
         if not pricing:
             return None
-        return {"pricing": pricing, "context_windows": context_windows}
+        return {
+            "pricing": pricing,
+            "context_windows": context_windows,
+            "output_token_limits": output_token_limits,
+        }
     except Exception:
         return None
 
@@ -122,6 +134,11 @@ def _extract_context_windows(data: dict) -> dict:
     return data.get("context_windows", {})
 
 
+def _extract_output_token_limits(data: dict) -> dict:
+    """Extract max output token limits from cache data."""
+    return data.get("output_token_limits", {})
+
+
 def build_pricing_table(
     url: str = _LITELLM_URL,
     cache_path: Path = _DEFAULT_CACHE_PATH,
@@ -152,6 +169,23 @@ def build_context_window_table(
     cached = _load_cache(cache_path)
     if cached:
         return _extract_context_windows(cached)
+
+    return {}
+
+
+def build_output_token_limit_table(
+    url: str = _LITELLM_URL,
+    cache_path: Path = _DEFAULT_CACHE_PATH,
+    timeout: int = _LITELLM_TIMEOUT,
+) -> dict:
+    live = _fetch_from_litellm(url, timeout)
+    if live:
+        _save_cache(live, cache_path)
+        return _extract_output_token_limits(live)
+
+    cached = _load_cache(cache_path)
+    if cached:
+        return _extract_output_token_limits(cached)
 
     return {}
 
@@ -208,6 +242,44 @@ _CONTEXT_WINDOW_FALLBACK: dict[str, int] = {
 }
 
 CONTEXT_WINDOWS: dict[str, int] = build_context_window_table()
+
+# Max output tokens per model — the hard API limit for a single response.
+# Used to cap Phase-2/3 initial_max_tokens so we never request more than the
+# model allows.  Live LiteLLM data supersedes these values at runtime.
+_MAX_OUTPUT_TOKENS_FALLBACK: dict[str, int] = {
+    "claude-haiku-4-5-20251001":            64_000,
+    "claude-haiku-4-5":                     64_000,
+    "claude-sonnet-4-20250514":             64_000,
+    "claude-sonnet-4-6":                    64_000,
+    "claude-opus-4-6":                      32_000,
+    "claude-3-7-sonnet-20250219":           64_000,
+    "claude-3-5-sonnet-20241022":           8_192,
+    "claude-3-5-haiku-20241022":            8_192,
+    "gemini/gemini-2.5-flash":              65_536,
+    "gemini/gemini-2.5-pro":               65_536,
+    "gemini/gemini-2.0-flash":             65_536,
+}
+
+OUTPUT_TOKEN_LIMITS: dict[str, int] = build_output_token_limit_table()
+
+
+def get_max_output_tokens(model_id: str) -> int:
+    """Return the maximum output tokens for one API response, or 32_000 if unknown.
+
+    Resolution order: live/cached LiteLLM data → hardcoded fallback → 32_000.
+    """
+    bare_id = model_id.split("/", 1)[1] if "/" in model_id else model_id
+    for lookup in (model_id, bare_id):
+        if lookup in OUTPUT_TOKEN_LIMITS:
+            return OUTPUT_TOKEN_LIMITS[lookup]
+        if lookup in _MAX_OUTPUT_TOKENS_FALLBACK:
+            return _MAX_OUTPUT_TOKENS_FALLBACK[lookup]
+        # Prefix match (e.g. "claude-haiku-4-5" matches "claude-haiku-4-5-20251001")
+        for key in _MAX_OUTPUT_TOKENS_FALLBACK:
+            if key.startswith(lookup) or lookup.startswith(key):
+                return _MAX_OUTPUT_TOKENS_FALLBACK[key]
+    return 32_000  # conservative safe default
+
 
 _PRICING_SOURCE_LABELS = {
     "live":      "{cost}  (live pricing)",
