@@ -773,6 +773,147 @@ def _make_backend(
 # ── agent loop ─────────────────────────────────────────────────────────────────
 
 
+_ENSEMBLE_RESULT_TRUNCATE = 800  # chars per query result in the combined context
+
+
+def _format_ensemble_context(schema_text: str, query_logs: list[list[dict]]) -> str:
+    """Format N Phase-1 query logs into a single Phase-2 initial message.
+
+    Each entry in query_logs is the query_log returned by one Phase-1 _run_phase
+    call: a list of dicts with keys sql, reason, plain_language, result.
+
+    The returned string provides the schema snapshot and every validated
+    query + result so the Phase-2 agent has the full exploration evidence.
+    """
+    n = len(query_logs)
+    total_queries = sum(len(log) for log in query_logs)
+    parts: list[str] = [
+        f"Here is the complete schema snapshot of the database:\n\n"
+        f"```\n{schema_text}\n```\n\n"
+        f"PHASE 1 was run {n} time{'s' if n != 1 else ''} independently on this database. "
+        f"Each run explored the schema and validated SQL against the live data. "
+        f"All {total_queries} validated queries and their results are provided below.\n"
+        f"Use this combined evidence to produce the most comprehensive and accurate catalogue possible.\n",
+    ]
+    bar = "═" * 60
+    for run_idx, log in enumerate(query_logs, 1):
+        parts.append(f"\n{bar}\nEXPLORATION RUN {run_idx} / {n}  ({len(log)} queries)\n{bar}\n")
+        for q_idx, q in enumerate(log, 1):
+            label = q.get("plain_language") or q.get("reason") or f"Query {q_idx}"
+            result = q["result"]
+            if len(result) > _ENSEMBLE_RESULT_TRUNCATE:
+                result = result[:_ENSEMBLE_RESULT_TRUNCATE] + "\n... (truncated)"
+            parts.append(
+                f"\n[{q_idx}] {label}\n"
+                f"SQL: {q['sql']}\n"
+                f"Result:\n{result}\n"
+            )
+    parts.append(
+        f"\n{bar}\n"
+        "You are in PHASE 2 — DOCUMENTATION. The run_query tool is not available.\n"
+        "Call finish_catalogue now. Draw on all exploration runs above — include every\n"
+        "metric that was validated by at least one run, and every table that was queried."
+    )
+    return "".join(parts)
+
+
+def _agent_loop_ensemble(
+    schema_text: str,
+    engine,
+    phase1_budget: int,
+    phase1_min_iter: int,
+    n_ensemble: int,
+    usage: dict,
+    table_columns: dict,
+    fk_pairs: list[tuple[str, str]] | None,
+    lookup_tables: set[str] | None,
+    started_at: float,
+    tracker: "_RequestTracker | None",
+    required_tables: set[str] | None,
+    min_metrics: int,
+    initial_message: str,
+) -> dict:
+    """Run N independent Phase-1 explorations, then one fresh Phase-2 documentation pass.
+
+    Each Phase-1 run gets its own backend and conversation history.  Their
+    validated query logs are combined into a single context for Phase-2 so
+    the documentation agent sees the full exploration evidence from all runs.
+    """
+    console.print(
+        Panel(
+            f"[bold cyan]Ensemble mode — {n_ensemble} independent Phase-1 explorations[/bold cyan]\n"
+            "[dim]Each run explores and validates SQL independently. "
+            "All results are combined for a single Phase-2 documentation pass.[/dim]",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
+
+    all_query_logs: list[list[dict]] = []
+    for run_num in range(1, n_ensemble + 1):
+        console.print(
+            Panel(
+                f"[bold]Ensemble exploration {run_num} / {n_ensemble}[/bold]",
+                border_style="blue",
+                padding=(0, 1),
+            )
+        )
+        run_backend = _make_backend(initial_message, SYSTEM_PROMPT)
+        _, _, _, query_log = _run_phase(
+            run_backend,
+            engine,
+            tools=[_RUN_QUERY_TOOL, _FINISH_CATALOGUE_TOOL],
+            max_iter=phase1_budget,
+            min_iter=phase1_min_iter,
+            phase_label=f"1.{run_num}/{n_ensemble} (exploration)",
+            usage=usage,
+            table_columns=table_columns,
+            fk_pairs=fk_pairs,
+            lookup_tables=lookup_tables,
+            tracker=tracker,
+            required_tables=required_tables,
+            min_metrics=min_metrics,
+        )
+        all_query_logs.append(query_log)
+        console.print(
+            f"[dim]  Exploration {run_num}/{n_ensemble} complete — "
+            f"{len(query_log)} queries validated[/dim]\n"
+        )
+
+    console.print(
+        Panel(
+            f"[bold cyan]All {n_ensemble} explorations complete — entering Phase 2 (documentation)[/bold cyan]\n"
+            f"[dim]{sum(len(l) for l in all_query_logs)} total validated queries across {n_ensemble} runs. "
+            "Compiling combined catalogue.[/dim]",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
+
+    ensemble_context = _format_ensemble_context(schema_text, all_query_logs)
+    phase2_backend = _make_backend(ensemble_context, SYSTEM_PROMPT)
+
+    catalogue_data, _, _, _ = _run_phase(
+        phase2_backend,
+        engine,
+        tools=[_FINISH_CATALOGUE_TOOL],
+        max_iter=5,
+        phase_label="2 (ensemble documentation)",
+        usage=usage,
+        table_columns=table_columns,
+        required_tables=required_tables,
+        min_metrics=min_metrics,
+        tracker=tracker,
+        initial_max_tokens=65_536,
+    )
+    if catalogue_data is not None:
+        return catalogue_data
+
+    raise RuntimeError(
+        f"Ensemble agent did not produce a catalogue after {n_ensemble} explorations."
+    )
+
+
 def _agent_loop(
     schema_text: str,
     engine,
@@ -800,8 +941,29 @@ def _agent_loop(
     # from Phase 1 carries forward into Phase 2.
     backend = _make_backend(initial_message, SYSTEM_PROMPT)
 
+    n_ensemble = int(_optional_env("SC_ENSEMBLE_RUNS", "1"))
+
+    if n_ensemble > 1:
+        return _agent_loop_ensemble(
+            schema_text=schema_text,
+            engine=engine,
+            phase1_budget=phase1_budget,
+            phase1_min_iter=phase1_min_iter,
+            n_ensemble=n_ensemble,
+            usage=usage,
+            table_columns=table_columns,
+            fk_pairs=fk_pairs,
+            lookup_tables=lookup_tables,
+            started_at=started_at,
+            tracker=tracker,
+            required_tables=required_tables,
+            min_metrics=min_metrics,
+            initial_message=initial_message,
+        )
+
+    # ── Single-run path (n_ensemble == 1) — original behaviour ─────────────────
     # Phase 1 — exploration with both tools available.
-    catalogue_data, last_rejection_reasons, _ = _run_phase(
+    catalogue_data, last_rejection_reasons, _, _ = _run_phase(
         backend,
         engine,
         tools=[_RUN_QUERY_TOOL, _FINISH_CATALOGUE_TOOL],
@@ -848,7 +1010,7 @@ def _agent_loop(
 
     backend.append_user(phase2_prompt)
 
-    catalogue_data, _, _ = _run_phase(
+    catalogue_data, _, _, _ = _run_phase(
         backend,
         engine,
         tools=[_FINISH_CATALOGUE_TOOL],
@@ -883,8 +1045,13 @@ def _run_phase(
     initial_max_tokens: int = 0,
     required_tables: set[str] | None = None,
     min_metrics: int = 0,
-) -> tuple[dict | None, list, int]:
-    """Run one phase of the agent loop. Returns (catalogue_data, last_rejection_reasons, iterations_run)."""
+) -> tuple[dict | None, list, int, list[dict]]:
+    """Run one phase of the agent loop.
+
+    Returns (catalogue_data, last_rejection_reasons, iterations_run, query_log).
+    query_log is a list of every run_query call that executed: each entry has
+    keys sql, reason, plain_language, result.
+    """
 
     # Proactive output-token throttling: only for the Anthropic backend, where
     # the per-minute limit is available from response headers.
@@ -896,6 +1063,7 @@ def _run_phase(
     last_rejection_reasons: list[str] = []
     fk_rejection_counts: dict = {}
     fk_waived: set = set()
+    query_log: list[dict] = []
     _current_max_tokens: int = initial_max_tokens if initial_max_tokens > 0 else _MAX_OUTPUT_TOKENS
     _consecutive_empty: int = 0
     _best_effort_catalogue: dict | None = None  # most recent rejected finish_catalogue, used as last-resort fallback
@@ -963,7 +1131,7 @@ def _run_phase(
                         "[yellow]  3 consecutive empty responses — falling back to best-effort "
                         "catalogue from earlier 'too early' submission.[/yellow]"
                     )
-                    return _best_effort_catalogue, last_rejection_reasons, i
+                    return _best_effort_catalogue, last_rejection_reasons, i, query_log
                 raise RuntimeError(
                     "Model returned an empty response 3 times in a row "
                     "(empty choices — API content-policy filter). "
@@ -1119,7 +1287,7 @@ def _run_phase(
                 f"[yellow]  Agent produced no tool calls in phase {phase_label}[/yellow]"
             )
             _print_iter_stats()
-            return None, last_rejection_reasons, i
+            return None, last_rejection_reasons, i, query_log
 
         # Process all tool_use blocks and collect results as (tool_id, content) pairs
         pending_results: list[tuple[str, str]] = []
@@ -1136,6 +1304,12 @@ def _run_phase(
         for block, (block_id, result) in zip(
             run_query_blocks, _run_queries_parallel(engine, run_query_blocks)
         ):
+            query_log.append({
+                "sql": block.input["sql"],
+                "reason": block.input.get("reason", ""),
+                "plain_language": block.input.get("plain_language", ""),
+                "result": result,
+            })
             _print_query(
                 sql=block.input["sql"],
                 reason=block.input.get("reason", ""),
@@ -1380,7 +1554,7 @@ def _run_phase(
             console.print(
                 f"[green]  finish_catalogue called in phase {phase_label}, iteration {i}.[/green]"
             )
-            return catalogue_data, [], i
+            return catalogue_data, [], i, query_log
 
         # Track last rejection reasons for the caller to use in the next phase prompt
         if rejection_reasons:
@@ -1388,9 +1562,9 @@ def _run_phase(
 
         # If stop_reason was end_turn despite having tool_use blocks, exit phase
         if backend.stop_reason(response) == "end_turn":
-            return None, last_rejection_reasons, i
+            return None, last_rejection_reasons, i, query_log
 
-    return None, last_rejection_reasons, max_iter
+    return None, last_rejection_reasons, max_iter, query_log
 
 
 # ── query execution ────────────────────────────────────────────────────────────
@@ -2163,7 +2337,7 @@ def _run_phase3(
     # the full schema + catalogue JSON and is repeated across all refinement iterations.
     backend = _make_backend(refinement_prompt, REFINEMENT_SYSTEM_PROMPT)
 
-    refined_data, _, _ = _run_phase(
+    refined_data, _, _, _ = _run_phase(
         backend,
         engine,
         tools=[_RUN_QUERY_TOOL, _FINISH_CATALOGUE_TOOL],
