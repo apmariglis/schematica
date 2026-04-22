@@ -20,16 +20,23 @@ session started. Its statistics are exact, not sampled:
   for time_range.start and time_range.end in every metric.
 - top_values for categorical columns are exhaustive counts — use them to identify \
   distinct values (e.g. revenue types, event types, outcomes) without querying.
-- n_null is the exact null count for every column — use it for data_quality_notes \
-  and confidence assessment without querying. data_quality_notes must never be \
-  empty for a real database. Include anything a metric consumer would need to know \
-  to avoid misreading a metric: high null rates (especially where null means \
-  "not applicable" or "not yet recorded" rather than zero), partial coverage \
-  (e.g. a table that only contains rows matching a specific status or tier), \
-  date/time gaps or sparse periods, and any schema quirk that silently skews \
-  aggregation results.
+- n_null is the exact null count for every column — use it for confidence \
+  assessment without querying.
 - row_count per table is exact.
 - Foreign keys are declared — use them for join planning without querying.
+
+THE FOLLOWING FIELDS ARE PRE-FILLED FROM THE SCHEMA — DO NOT INCLUDE THEM:
+- table_relationships: derived directly from declared FK constraints.
+- time_coverage: derived from MIN/MAX of all date columns.
+- tables[].row_count: taken from the snapshot row counts.
+- tables[].data_quality_notes: generated from column null rates.
+Do NOT output these fields in finish_catalogue — they are ignored if present.
+
+For the top-level data_quality_notes, include ONLY cross-table semantic \
+observations that cannot be derived from null rates alone — for example: two \
+columns in different tables measuring the same concept differently, a FK that \
+references only a subset of values, or a schema quirk that silently skews \
+aggregation. Do not repeat null-rate or row-count facts.
 
 Only use run_query to validate aggregation logic and SQL correctness. Never use it \
 to rediscover facts the snapshot already provides. If a query result appears to \
@@ -251,8 +258,9 @@ def make_run_query_tool(max_rows: int) -> dict:
 _BARE_TABLES_ERROR_MSG = (
     'tables entries must be full objects, not bare strings. '
     'Each entry must look like: '
-    '{"name": "orders", "row_count": 12500, "description": "One row per order.", '
+    '{"name": "orders", "description": "One row per order.", '
     '"key_columns": ["order_id", "created_at"]}. '
+    'row_count and data_quality_notes are pre-filled from the schema — omit them. '
     'Do not pass table names as plain strings.'
 )
 
@@ -260,7 +268,8 @@ _TABLES_NOT_LIST_ERROR_MSG = (
     'tables must be a list of table objects, not a string. '
     'You submitted tables as a single string value instead of an array. '
     'Pass tables as a JSON array: '
-    '[{"name": "orders", "row_count": 12500, "description": "...", "key_columns": [...]}]. '
+    '[{"name": "orders", "description": "...", "key_columns": [...]}]. '
+    'row_count and data_quality_notes are pre-filled from the schema — omit them. '
     'Do not JSON-encode the array — pass the list directly.'
 )
 
@@ -313,20 +322,18 @@ _FINISH_CATALOGUE_TOOL = {
                 "type": "array",
                 "description": (
                     'Each entry is a full object — NOT a string. '
-                    'Example: {"name": "orders", "row_count": 12500, '
-                    '"description": "One row per order.", '
+                    'row_count and data_quality_notes are pre-filled from the schema — omit them. '
+                    'Example: {"name": "orders", "description": "One row per order.", '
                     '"key_columns": ["order_id", "created_at"]}.'
                 ),
                 "items": {
                     "type": "object",
                     "properties": {
                         "name":        {"type": "string"},
-                        "row_count":   {"type": "integer"},
                         "description": {"type": "string"},
                         "key_columns": {"type": "array", "items": {"type": "string"}},
-                        "data_quality_notes": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["name", "row_count", "description", "key_columns"],
+                    "required": ["name", "description", "key_columns"],
                 },
             },
             "measurable_metrics": {
@@ -362,14 +369,6 @@ _FINISH_CATALOGUE_TOOL = {
                     ],
                 },
             },
-            "time_coverage": {
-                "type": "object",
-                "properties": {
-                    "start": {"type": "string"},
-                    "end":   {"type": "string"},
-                },
-                "required": ["start", "end"],
-            },
             "queryable_facts": {
                 "type": "array",
                 "description": "Non-time-series data worth preserving: reference tables, static lookups, point-in-time snapshots.",
@@ -387,6 +386,11 @@ _FINISH_CATALOGUE_TOOL = {
             },
             "data_quality_notes": {
                 "type": "array",
+                "description": (
+                    "Cross-table semantic observations only — e.g. two columns measuring the same "
+                    "concept differently, or a FK that references only a subset of values. "
+                    "Do NOT repeat null-rate or row-count facts — those are pre-filled from the schema."
+                ),
                 "items": {"type": "string"},
             },
             "key_terms": {
@@ -399,19 +403,6 @@ _FINISH_CATALOGUE_TOOL = {
                         "definition": {"type": "string"},
                     },
                     "required": ["term", "definition"],
-                },
-            },
-            "table_relationships": {
-                "type": "array",
-                "description": "Foreign key relationships between tables",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "table_a":  {"type": "string", "description": "Table holding the FK"},
-                        "table_b":  {"type": "string", "description": "Referenced table"},
-                        "join_key": {"type": "string", "description": "Shared column name"},
-                    },
-                    "required": ["table_a", "table_b", "join_key"],
                 },
             },
             "description": {
@@ -436,9 +427,8 @@ _FINISH_CATALOGUE_TOOL = {
         },
         "required": [
             "tables", "measurable_metrics", "queryable_facts",
-            "time_coverage", "data_quality_notes",
             "description", "overview",
-            "key_terms", "table_relationships",
+            "key_terms",
         ],
     },
 }
