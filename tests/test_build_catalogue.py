@@ -16,11 +16,22 @@ from schematica.agent import _build_catalogue
 SNAPSHOT = {
     "connection_string": "sqlite:///test.db",
     "dialect": "sqlite",
+    "tables": [
+        {
+            "name": "t",
+            "row_count": 10,
+            "columns": [
+                {"name": "dt", "type": "DATE", "stats": {"min": "2024-01-01", "max": "2024-12-31", "n_null": 0}},
+                {"name": "val", "type": "INTEGER", "stats": {"n_null": 0}},
+            ],
+            "foreign_keys": [],
+        }
+    ],
 }
 
 VALID_DATA = {
     "description": "A test catalogue",
-    "tables": [{"name": "t", "row_count": 10, "description": "test table", "key_columns": ["dt", "val"]}],
+    "tables": [{"name": "t", "description": "test table", "key_columns": ["dt", "val"]}],
     "measurable_metrics": [
         {
             "name": "monthly_count",
@@ -32,10 +43,10 @@ VALID_DATA = {
             "tables_used": ["t"],
             "confidence": "high",
             "agent_notes": "",
+            "group": "Counts",
         }
     ],
     "queryable_facts": [],
-    "time_coverage": {"start": "2024-01-01", "end": "2024-12-31"},
     "data_quality_notes": [],
 }
 
@@ -80,10 +91,12 @@ def test_null_queryable_facts_falls_back_to_empty_list():
     assert catalogue.queryable_facts == []
 
 
-def test_null_data_quality_notes_falls_back_to_empty_list():
+def test_null_data_quality_notes_does_not_raise():
+    # LLM submitted data_quality_notes: null — must not crash.
+    # Deterministic notes from the schema (null rates, small tables) are still added.
     data = {**VALID_DATA, "data_quality_notes": None}
     catalogue = _build_catalogue(data, SNAPSHOT)
-    assert catalogue.data_quality_notes == []
+    assert isinstance(catalogue.data_quality_notes, list)
 
 
 # ── absent optional fields still fall back to defaults ───────────────────────

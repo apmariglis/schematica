@@ -40,25 +40,26 @@ def _make_catalogue(overview: str = "") -> DataCatalogue:
 
 
 def test_catalogue_json_is_written(tmp_path):
-    out = str(tmp_path / "solar_wind_catalogue_3.json")
+    # out_path is a pattern (no index, no extension) — _write_output appends _1.json
+    out = str(tmp_path / "solar_wind_catalogue")
     _write_output(_make_catalogue(), out)
-    assert (tmp_path / "solar_wind_catalogue_3.json").exists()
+    assert (tmp_path / "solar_wind_catalogue_1.json").exists()
 
 
 def test_overview_md_is_written_alongside_json(tmp_path):
-    out = str(tmp_path / "solar_wind_catalogue_3.json")
+    out = str(tmp_path / "solar_wind_catalogue")
     _write_output(_make_catalogue(overview="This database tracks solar assets."), out)
-    assert (tmp_path / "solar_wind_overview_3.md").exists()
+    assert (tmp_path / "solar_wind_overview_1.md").exists()
 
 
 def test_overview_md_contains_overview_text(tmp_path):
-    out = str(tmp_path / "mydb_catalogue_1.json")
+    out = str(tmp_path / "mydb_catalogue")
     _write_output(_make_catalogue(overview="Detailed overview text here."), out)
     content = (tmp_path / "mydb_overview_1.md").read_text()
     assert "Detailed overview text here." in content
 
 
 def test_overview_md_not_written_when_overview_is_empty(tmp_path):
-    out = str(tmp_path / "mydb_catalogue_1.json")
+    out = str(tmp_path / "mydb_catalogue")
     _write_output(_make_catalogue(overview=""), out)
     assert not (tmp_path / "mydb_overview_1.md").exists()

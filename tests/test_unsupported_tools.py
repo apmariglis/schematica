@@ -123,71 +123,43 @@ def test_rate_limit_initial_backoff_is_65_seconds():
     assert first_sleep >= 60
 
 
-# ── empty choices — nudge once, then give up ──────────────────────────────────
+# ── empty choices — re-raised immediately (nudge/retry handled by _run_phase) ─
 
-def test_empty_choices_triggers_append_user_nudge():
-    # A single empty-choices response must cause append_user to be called once.
-    backend = _NudgeableBackend(raise_on_first=1, exc=Exception(_EMPTY_CHOICES_MSG))
-
-    with patch("schematica.agent.console"):
-        _call_with_retry(backend, [])
-
-    assert len(backend.nudge_messages) == 1
-
-
-def test_empty_choices_nudge_message_is_nonempty():
-    backend = _NudgeableBackend(raise_on_first=1, exc=Exception(_EMPTY_CHOICES_MSG))
-
-    with patch("schematica.agent.console"):
-        _call_with_retry(backend, [])
-
-    assert backend.nudge_messages[0].strip()
-
-
-def test_empty_choices_retries_call_after_nudge():
-    # call() should be invoked twice: once (empty), once after the nudge (success).
-    backend = _NudgeableBackend(raise_on_first=1, exc=Exception(_EMPTY_CHOICES_MSG))
-
-    with patch("schematica.agent.console"):
-        _call_with_retry(backend, [])
-
-    assert backend.call_count == 2
-
-
-def test_empty_choices_returns_result_after_successful_nudge():
-    backend = _NudgeableBackend(raise_on_first=1, exc=Exception(_EMPTY_CHOICES_MSG))
-
-    with patch("schematica.agent.console"):
-        result = _call_with_retry(backend, [])
-
-    assert isinstance(result, _MockResponse)
-
-
-def test_empty_choices_twice_raises():
-    # Two consecutive empty-choices responses must raise — nudging didn't help.
+def test_empty_choices_raises_immediately():
+    # _call_with_retry must re-raise on the first empty-choices response
+    # without retrying — the outer loop (_run_phase) owns retry logic.
     backend = _CountingBackend(Exception(_EMPTY_CHOICES_MSG))
 
-    with patch("schematica.agent.console"):
-        with pytest.raises(Exception, match="empty"):
-            _call_with_retry(backend, [])
+    with pytest.raises(Exception, match="empty choices"):
+        _call_with_retry(backend, [])
 
 
-def test_empty_choices_twice_calls_backend_exactly_twice():
+def test_empty_choices_calls_backend_exactly_once():
+    # Only one attempt is made — no internal retry for empty choices.
     backend = _CountingBackend(Exception(_EMPTY_CHOICES_MSG))
 
-    with patch("schematica.agent.console"):
-        with pytest.raises(Exception):
-            _call_with_retry(backend, [])
+    with pytest.raises(Exception):
+        _call_with_retry(backend, [])
 
-    assert backend.call_count == 2
+    assert backend.call_count == 1
 
 
 def test_empty_choices_does_not_sleep():
-    # Empty-choices is not a rate limit — no sleep between nudge attempts.
+    # Empty-choices is not a rate limit — no sleep.
     backend = _CountingBackend(Exception(_EMPTY_CHOICES_MSG))
 
-    with patch("time.sleep") as mock_sleep, patch("schematica.agent.console"):
+    with patch("time.sleep") as mock_sleep:
         with pytest.raises(Exception):
             _call_with_retry(backend, [])
 
     mock_sleep.assert_not_called()
+
+
+def test_empty_choices_does_not_append_user_nudge():
+    # Nudging is the caller's responsibility, not _call_with_retry's.
+    backend = _NudgeableBackend(raise_on_first=1, exc=Exception(_EMPTY_CHOICES_MSG))
+
+    with pytest.raises(Exception):
+        _call_with_retry(backend, [])
+
+    assert len(backend.nudge_messages) == 0

@@ -50,10 +50,11 @@ def test_tables_description_shows_name_field_in_example():
     assert '"name"' in desc
 
 
-def test_tables_description_shows_row_count_field_in_example():
+def test_tables_description_says_row_count_is_pre_filled():
+    # row_count is now computed from the schema snapshot — the LLM must not submit it.
     desc = _FINISH_CATALOGUE_TOOL["input_schema"]["properties"]["tables"]["description"]
 
-    assert '"row_count"' in desc
+    assert "pre-filled" in desc.lower() or "row_count" not in desc
 
 
 def test_tables_description_shows_key_columns_field_in_example():
@@ -79,8 +80,9 @@ def test_bare_tables_rejection_message_shows_name_field():
     assert '"name"' in _BARE_TABLES_ERROR_MSG
 
 
-def test_bare_tables_rejection_message_shows_row_count_field():
-    assert '"row_count"' in _BARE_TABLES_ERROR_MSG
+def test_bare_tables_rejection_message_explains_row_count_is_pre_filled():
+    # row_count is pre-filled from schema — the rejection message must tell the model not to submit it.
+    assert "pre-filled" in _BARE_TABLES_ERROR_MSG.lower()
 
 
 def test_bare_tables_rejection_message_shows_key_columns_field():
