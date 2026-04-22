@@ -168,6 +168,7 @@ _MIN_ITER_FLOOR = int(_require_env("SC_MIN_ITER_FLOOR"))
 _MIN_ITER_DIVISOR = int(_require_env("SC_MIN_ITER_DIVISOR"))
 _REFINEMENT_BUDGET = int(_require_env("SC_REFINEMENT_BUDGET"))
 _MAX_OUTPUT_TOKENS = int(_require_env("SC_MAX_OUTPUT_TOKENS"))
+_MAX_QUERIES_PER_TURN = int(_require_env("SC_MAX_QUERIES_PER_TURN"))
 
 
 def _apply_model_override(new_model: str, cache_override: "bool | None" = None) -> None:
@@ -783,6 +784,8 @@ def _agent_loop(
     lookup_tables: set[str] | None = None,
     started_at: float = 0.0,
     tracker: "_RequestTracker | None" = None,
+    required_tables: set[str] | None = None,
+    min_metrics: int = 0,
 ) -> dict:
     initial_message = (
         f"Here is the complete schema snapshot of the database:\n\n"
@@ -810,6 +813,8 @@ def _agent_loop(
         fk_pairs=fk_pairs,
         lookup_tables=lookup_tables,
         tracker=tracker,
+        required_tables=required_tables,
+        min_metrics=min_metrics,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -851,7 +856,10 @@ def _agent_loop(
         phase_label="2 (documentation)",
         usage=usage,
         table_columns=table_columns,
+        required_tables=required_tables,
+        min_metrics=min_metrics,
         tracker=tracker,
+        initial_max_tokens=65_536,
     )
     if catalogue_data is not None:
         return catalogue_data
@@ -872,6 +880,9 @@ def _run_phase(
     lookup_tables: set[str] | None = None,
     tracker: "_RequestTracker | None" = None,
     nudge_text: str | None = None,
+    initial_max_tokens: int = 0,
+    required_tables: set[str] | None = None,
+    min_metrics: int = 0,
 ) -> tuple[dict | None, list, int]:
     """Run one phase of the agent loop. Returns (catalogue_data, last_rejection_reasons, iterations_run)."""
 
@@ -885,8 +896,9 @@ def _run_phase(
     last_rejection_reasons: list[str] = []
     fk_rejection_counts: dict = {}
     fk_waived: set = set()
-    _current_max_tokens: int = _MAX_OUTPUT_TOKENS
+    _current_max_tokens: int = initial_max_tokens if initial_max_tokens > 0 else _MAX_OUTPUT_TOKENS
     _consecutive_empty: int = 0
+    _best_effort_catalogue: dict | None = None  # most recent rejected finish_catalogue, used as last-resort fallback
     for i in range(1, max_iter + 1):
         rejection_reasons: list[str] = []
         console.rule(f"[dim] Phase {phase_label} — iter {i}/{max_iter} [/dim]", style="dim", characters="━")
@@ -910,22 +922,8 @@ def _run_phase(
                 raise
             _consecutive_empty += 1
             _et = getattr(exc, "empty_response_tokens", {})
-            _tok_parts = []
-            if _et.get("prompt_tokens") is not None:
-                _tok_parts.append(f"prompt={_et['prompt_tokens']:,}")
-            if _et.get("output_tokens") is not None:
-                _tok_parts.append(f"output={_et['output_tokens']:,}")
-            if _et.get("thinking_tokens") is not None:
-                _tok_parts.append(f"think={_et['thinking_tokens']:,}")
-            _tok_str = f"  [{', '.join(_tok_parts)}]" if _tok_parts else ""
-            if _consecutive_empty >= 2:
-                raise RuntimeError(
-                    "Model returned an empty response twice in a row "
-                    "(empty choices — API content-policy filter). "
-                    "The conversation context may have triggered a safety filter. "
-                    f"Try a different model or database.{_tok_str}"
-                ) from exc
-            # Account for tokens consumed by the empty response.
+            # Account for tokens consumed by the empty response — always,
+            # even if this is the second consecutive empty and we're about to raise.
             _empty_now = time.monotonic()
             _empty_duration = _empty_now - call_start
             if tracker is not None:
@@ -959,6 +957,19 @@ def _run_phase(
             for _line in _empty_stats.splitlines():
                 console.print(f"[dim]  {_line}[/dim]")
             console.print()
+            if _consecutive_empty >= 3:
+                if _best_effort_catalogue is not None:
+                    console.print(
+                        "[yellow]  3 consecutive empty responses — falling back to best-effort "
+                        "catalogue from earlier 'too early' submission.[/yellow]"
+                    )
+                    return _best_effort_catalogue, last_rejection_reasons, i
+                raise RuntimeError(
+                    "Model returned an empty response 3 times in a row "
+                    "(empty choices — API content-policy filter). "
+                    "The conversation context may have triggered a safety filter. "
+                    "Try a different model or database."
+                ) from exc
             # Double the output budget before retrying. Gemini 2.5 Flash's
             # dynamic thinking can consume a large share of max_tokens,
             # leaving too little for actual output.
@@ -967,12 +978,16 @@ def _run_phase(
                 f"[yellow]  Empty response from API — nudging and retrying "
                 f"(output budget raised to {_current_max_tokens:,} tokens)[/yellow]"
             )
-            default_nudge = (
-                "Your previous response was empty — the API returned no content. "
-                "Please continue: call run_query to explore the database further, "
-                "or call finish_catalogue if you have enough data."
-            )
-            backend.append_user(nudge_text if nudge_text is not None else default_nudge)
+            # Only nudge if there are iterations left — on the last iteration the
+            # phase is ending and a dangling nudge would stack with the next phase's
+            # transition message, confusing the model with consecutive user turns.
+            if i < max_iter:
+                default_nudge = (
+                    "Your previous response was empty — the API returned no content. "
+                    "Please continue: call run_query to explore the database further, "
+                    "or call finish_catalogue if you have enough data."
+                )
+                backend.append_user(nudge_text if nudge_text is not None else default_nudge)
             continue  # this increments i, making the retry a new numbered iteration
         now = time.monotonic()
         iter_duration = now - call_start
@@ -1113,6 +1128,11 @@ def _run_phase(
         # Run all run_query blocks concurrently, then print results in order.
         # executor.map preserves input order so zip is safe.
         run_query_blocks = [b for b in tool_use_blocks if b.name == "run_query"]
+        if _MAX_QUERIES_PER_TURN > 0 and len(run_query_blocks) > _MAX_QUERIES_PER_TURN:
+            deferred_blocks = run_query_blocks[_MAX_QUERIES_PER_TURN:]
+            run_query_blocks = run_query_blocks[:_MAX_QUERIES_PER_TURN]
+            for b in deferred_blocks:
+                pending_results.append((b.id, "Query deferred — too many queries in one turn. Resubmit in your next response."))
         for block, (block_id, result) in zip(
             run_query_blocks, _run_queries_parallel(engine, run_query_blocks)
         ):
@@ -1147,7 +1167,6 @@ def _run_phase(
                     "tables",
                     "measurable_metrics",
                     "queryable_facts",
-                    "time_coverage",
                     "description",
                     "overview",
                 }
@@ -1241,6 +1260,39 @@ def _run_phase(
                         rejection_reasons.append(
                             _FK_REJECTION_MSG.format(pairs_str=pairs_str)
                         )
+                # Per-table coverage: every non-lookup table with temporal data
+                # must appear in at least one measurable_metric.
+                if required_tables and not rejection_reasons:
+                    submitted_metrics = submitted_metrics if fk_pairs else [
+                        m for m in block.input.get("measurable_metrics", [])
+                        if isinstance(m, dict)
+                    ]
+                    covered = {
+                        t.lower()
+                        for m in submitted_metrics
+                        for t in m.get("tables_used", [])
+                    }
+                    missing_coverage = sorted(
+                        t for t in required_tables if t.lower() not in covered
+                    )
+                    if missing_coverage:
+                        rejection_reasons.append(
+                            f"Missing measurable_metrics for tables with temporal data: "
+                            f"{', '.join(missing_coverage)}. Each of these tables must appear "
+                            f"in at least one measurable_metric's tables_used."
+                        )
+                # Metric count floor: guard against sparse runs.
+                if min_metrics > 0 and not rejection_reasons:
+                    n_submitted = len([
+                        m for m in block.input.get("measurable_metrics", [])
+                        if isinstance(m, dict)
+                    ])
+                    if n_submitted < min_metrics:
+                        rejection_reasons.append(
+                            f"Too few metrics: {n_submitted} submitted, minimum is {min_metrics}. "
+                            f"Explore more of the schema and add measurable_metrics for all "
+                            f"tables that contain temporal data."
+                        )
                 # Pre-validate all per-item fields so errors are returned to the
                 # agent as rejection feedback rather than crashing in _build_catalogue.
                 if not rejection_reasons:
@@ -1292,41 +1344,29 @@ def _run_phase(
                             if isinstance(_raw_facts, list)
                             else []
                         ),
-                        "time_coverage": block.input.get("time_coverage"),
                         "data_quality_notes": len(
                             block.input.get("data_quality_notes") or []
                         ),
                     }
+                    # Always save the most recent submission as a best-effort fallback.
+                    # If the model later gets stuck returning empty responses, we use
+                    # this rather than failing with no output at all.
+                    _best_effort_catalogue = block.input
                     backend.compress_finish_catalogue(block.id, _compress_summary)
                     pending_results.append(
                         (
                             block.id,
                             f"ERROR: {reasons_text}. "
                             "Resubmit finish_catalogue with all required fields present and non-empty "
-                            "where data was found: tables, measurable_metrics, time_coverage, "
-                            "data_quality_notes, description, overview. "
-                            "queryable_facts may be empty if none were found.",
+                            "where data was found: tables, measurable_metrics, description, overview. "
+                            "queryable_facts may be empty if none were found. "
+                            "time_coverage, table_relationships, and per-table data_quality_notes "
+                            "are pre-filled — do not include them.",
                         )
                     )
                 else:
                     catalogue_data = block.input
-                    dq_notes = block.input.get("data_quality_notes") or []
-                    if not dq_notes:
-                        console.print(
-                            "[yellow]  ⚠ data_quality_notes is empty — "
-                            "accepted, but the schema snapshot likely shows nullable columns "
-                            "or partial coverage worth documenting.[/yellow]"
-                        )
-                        acceptance_msg = (
-                            "Catalogue accepted. "
-                            "NOTE: data_quality_notes is empty. Real databases almost always "
-                            "have nullable columns or partial coverage that metric consumers "
-                            "need to know about. Review the schema snapshot and add relevant "
-                            "notes in a follow-up if you missed any."
-                        )
-                    else:
-                        acceptance_msg = "Catalogue accepted."
-                    pending_results.append((block.id, acceptance_msg))
+                    pending_results.append((block.id, "Catalogue accepted."))
 
         # All tool output is done — print stats before state management
         _print_iter_stats()
@@ -1427,8 +1467,114 @@ def _run_queries_parallel(engine, run_query_blocks: list) -> list[tuple[str, str
 
 # ── output construction ────────────────────────────────────────────────────────
 
+_NULL_RATE_THRESHOLD = 0.20  # columns with >= 20% nulls get a data quality note
+_SMALL_TABLE_ROWS    = 100   # tables with fewer rows than this get a size note
+
+
+def _deterministic_catalogue_fields(snapshot: dict) -> dict:
+    """Compute catalogue fields that are fully determined by the schema snapshot.
+
+    Returns a dict with:
+      table_relationships  — from FK declarations in the schema
+      time_coverage        — MIN/MAX across all date/timestamp columns
+      tables_meta          — {table_name: {row_count, data_quality_notes}}
+      data_quality_notes   — database-wide null-rate and small-table notes
+    """
+    # ── table_relationships ────────────────────────────────────────────────────
+    relationships: list[dict] = []
+    for tbl in snapshot["tables"]:
+        for fk in tbl.get("foreign_keys", []):
+            from_cols = fk.get("from_cols", [])
+            to_cols   = fk.get("to_cols", [])
+            if len(from_cols) == 1 and len(to_cols) == 1:
+                relationships.append({
+                    "table_a":  tbl["name"],
+                    "table_b":  fk["to_table"],
+                    "join_key": from_cols[0],
+                })
+
+    # ── time_coverage ─────────────────────────────────────────────────────────
+    # Detect date columns by type name OR by ISO-date-shaped min/max values
+    # (SQLite stores dates as TEXT, so type-name matching alone misses them).
+    import re as _re
+    _iso_date_re = _re.compile(r"^\d{4}-\d{2}-\d{2}")
+    date_type_hints = ("DATE", "TIME", "TIMESTAMP", "DATETIME")
+
+    all_mins: list[str] = []
+    all_maxs: list[str] = []
+    for tbl in snapshot["tables"]:
+        for col in tbl.get("columns", []):
+            col_type = col.get("type", "").upper()
+            stats = col.get("stats", {})
+            mn, mx = stats.get("min"), stats.get("max")
+            type_is_date = any(h in col_type for h in date_type_hints)
+            value_looks_like_date = (
+                isinstance(mn, str) and _iso_date_re.match(mn)
+            )
+            if not (type_is_date or value_looks_like_date):
+                continue
+            if mn:
+                all_mins.append(str(mn)[:10])
+            if mx:
+                all_maxs.append(str(mx)[:10])
+    time_coverage = {
+        "start": min(all_mins) if all_mins else "",
+        "end":   max(all_maxs) if all_maxs else "",
+    }
+
+    # ── per-table null-rate notes + row_count ─────────────────────────────────
+    tables_meta: dict[str, dict] = {}
+    db_wide_notes: list[str] = []
+    for tbl in snapshot["tables"]:
+        row_count = tbl["row_count"]
+        notes: list[str] = []
+        for col in tbl.get("columns", []):
+            n_null = col.get("stats", {}).get("n_null", 0)
+            if row_count > 0 and n_null > 0:
+                rate = n_null / row_count
+                if rate >= _NULL_RATE_THRESHOLD:
+                    notes.append(
+                        f"`{col['name']}` has {n_null:,} nulls "
+                        f"({rate * 100:.0f}% of rows)"
+                    )
+        tables_meta[tbl["name"]] = {"row_count": row_count, "data_quality_notes": notes}
+        if 0 < row_count < _SMALL_TABLE_ROWS:
+            db_wide_notes.append(
+                f"`{tbl['name']}` is a small table ({row_count} rows) — "
+                "metrics built on it may cover only a narrow slice of data."
+            )
+
+    return {
+        "table_relationships": relationships,
+        "time_coverage":       time_coverage,
+        "tables_meta":         tables_meta,
+        "data_quality_notes":  db_wide_notes,
+    }
+
 
 def _build_catalogue(data: dict, snapshot: dict) -> DataCatalogue:
+    det = _deterministic_catalogue_fields(snapshot)
+
+    # Merge per-table deterministic fields (row_count, data_quality_notes) with
+    # the LLM's per-table descriptions and key_columns.
+    tables_out = []
+    for tbl in data.get("tables", []):
+        name = tbl.get("name", "") if isinstance(tbl, dict) else ""
+        meta = det["tables_meta"].get(name, {})
+        tables_out.append({
+            "name":               name,
+            "row_count":          meta.get("row_count", tbl.get("row_count", 0)),
+            "description":        tbl.get("description", "") if isinstance(tbl, dict) else "",
+            "key_columns":        tbl.get("key_columns", []) if isinstance(tbl, dict) else [],
+            "data_quality_notes": meta.get("data_quality_notes", []),
+        })
+
+    # LLM may provide cross-table semantic notes; prepend the deterministic ones.
+    llm_dq = data.get("data_quality_notes") or []
+    if isinstance(llm_dq, str):
+        llm_dq = [llm_dq]
+    combined_dq = det["data_quality_notes"] + [n for n in llm_dq if isinstance(n, str)]
+
     try:
         return DataCatalogue(
             analysed_at=datetime.now().isoformat(timespec="seconds"),
@@ -1437,13 +1583,13 @@ def _build_catalogue(data: dict, snapshot: dict) -> DataCatalogue:
             dialect=snapshot["dialect"],
             description=data.get("description") or "",
             overview=data.get("overview") or "",
-            tables=data["tables"],
+            tables=tables_out,
             measurable_metrics=data["measurable_metrics"],
             queryable_facts=data.get("queryable_facts") or [],
-            time_coverage=data["time_coverage"],
-            data_quality_notes=data.get("data_quality_notes") or [],
+            time_coverage=det["time_coverage"],
+            data_quality_notes=combined_dq,
             key_terms=data.get("key_terms") or [],
-            table_relationships=data.get("table_relationships") or [],
+            table_relationships=det["table_relationships"],
         )
     except Exception as exc:
         console.print(f"[red]Catalogue validation error: {exc}[/red]")
@@ -1721,15 +1867,34 @@ def _render_overview_md(catalogue: "DataCatalogue") -> str:
 
 
 def _write_output(catalogue: DataCatalogue, out_path: str) -> None:
+    """Write catalogue JSON to an auto-indexed path, claimed atomically.
+
+    out_path is a pattern without index or extension, e.g.:
+        ../DBs/gemini-2.5-flash/saas_catalogue
+
+    The final filename is  <pattern>_<n>.json  where <n> is the lowest
+    integer not already on disk.  O_EXCL guarantees that two concurrent
+    processes never write to the same file even if they computed the same
+    index at startup.
+    """
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w") as f:
-        json.dump(catalogue.model_dump(), f, indent=2)
-    console.print(f"\n[bold green]Catalogue written to {out_path}[/bold green]")
+
+    idx = 1
+    while True:
+        candidate = p.parent / f"{p.name}_{idx}.json"
+        try:
+            fd = os.open(str(candidate), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(fd, "w") as f:
+                json.dump(catalogue.model_dump(), f, indent=2)
+            break
+        except FileExistsError:
+            idx += 1
+
+    console.print(f"\n[bold green]Catalogue written to {candidate}[/bold green]")
 
     if catalogue.overview:
-        # Derive overview path: <stem replacing "_catalogue_N" with "_overview_N">.md
-        overview_path = p.parent / p.name.replace("_catalogue_", "_overview_").replace(
+        overview_path = candidate.parent / candidate.name.replace("_catalogue_", "_overview_").replace(
             ".json", ".md"
         )
         overview_path.write_text(_render_overview_md(catalogue))
@@ -2007,6 +2172,7 @@ def _run_phase3(
         usage=usage,
         table_columns=table_columns,
         tracker=tracker,
+        initial_max_tokens=65_536,
         nudge_text=(
             "Your previous response was empty — the API returned no content. "
             "Please continue: use run_query to investigate the reported issues, "
@@ -2038,6 +2204,21 @@ def _run_phase3(
             "tables": [],
         },
     )
+    # Restore deterministic fields from the Phase 1 catalogue — schema facts
+    # (FK relationships, time coverage, row counts, null-rate notes) don't
+    # change during refinement, but the stub snapshot above produces blanks.
+    orig_tables_by_name = {t.name: t for t in catalogue.tables}
+    refined_catalogue = refined_catalogue.model_copy(update={
+        "table_relationships": catalogue.table_relationships,
+        "time_coverage":       catalogue.time_coverage,
+        "tables": [
+            t.model_copy(update={
+                "row_count":          orig_tables_by_name[t.name].row_count,
+                "data_quality_notes": orig_tables_by_name[t.name].data_quality_notes,
+            }) if t.name in orig_tables_by_name else t
+            for t in refined_catalogue.tables
+        ],
+    })
     refined_catalogue = _drop_broken_sql(refined_catalogue, engine)
 
     patched_catalogue = catalogue.model_copy(

@@ -24,10 +24,12 @@ Both expose the same interface so the agent loop is backend-agnostic:
 from __future__ import annotations
 
 import json
+import os
 import warnings
 from types import SimpleNamespace
 
-_empty_response_count = 0  # incremented each time the API returns empty choices
+_INSTANCE_ID = os.getpid()  # unique per process — disambiguates concurrent runs
+_empty_response_count = 0   # incremented each time the API returns empty choices
 
 
 def _try_int(val) -> int | None:
@@ -53,7 +55,7 @@ def _write_empty_response_dump(
     A new numbered file is created for each empty response so every occurrence
     is preserved even when the model recovers after a nudge and later fails again.
     """
-    path = f"debug_empty_{n}.json"
+    path = f"debug_empty_{_INSTANCE_ID}_{n}.json"
     payload = {
         "model": model,
         "prompt_tokens": prompt_tokens,

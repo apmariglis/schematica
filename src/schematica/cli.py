@@ -36,19 +36,6 @@ def _model_folder_name(model: str) -> str:
     return re.sub(r"[^\w.\-]", "_", name)
 
 
-def _next_catalogue_index(out_dir: Path, db_name: str) -> int:
-    """Return the next available 1-based index for <db_name>_catalogue_<n>.json."""
-    if not out_dir.exists():
-        return 1
-    existing = list(out_dir.glob(f"{db_name}_catalogue_*.json"))
-    indices = []
-    for p in existing:
-        stem = p.stem  # e.g. solar_wind_catalogue_3
-        suffix = stem.rsplit("_", 1)[-1]
-        if suffix.isdigit():
-            indices.append(int(suffix))
-    return max(indices, default=0) + 1
-
 
 def _db_stem(connection_string: str) -> str:
     """Extract a filesystem-safe database name from any connection string.
@@ -62,20 +49,19 @@ def _db_stem(connection_string: str) -> str:
     return parsed.path.lstrip("/").split("?")[0] or "db"
 
 
-def _derive_catalogue_path(connection_string: str, model: str, out_dir: str) -> str:
+def _derive_catalogue_pattern(connection_string: str, model: str, out_dir: str) -> str:
     """
-    Derive the catalogue output path.
+    Derive the catalogue output path pattern (no index, no extension).
 
-    Catalogues are stored as <out_dir>/<model>/<db_stem>_catalogue_<n>.json,
-    where <n> auto-increments so repeated runs never overwrite each other.
+    The actual filename is determined at write time so that concurrent runs
+    never collide:  <out_dir>/<model>/<db_stem>_catalogue
 
-    sqlite:///data/solar_wind.db  →  <out_dir>/gemini-2.5-flash/solar_wind_catalogue_1.json
-    postgresql://.../mydb         →  <out_dir>/gemini-2.5-flash/mydb_catalogue_1.json
+    sqlite:///data/solar_wind.db  →  <out_dir>/gemini-2.5-flash/solar_wind_catalogue
+    postgresql://.../mydb         →  <out_dir>/gemini-2.5-flash/mydb_catalogue
     """
     db_name = _db_stem(connection_string)
     model_dir = Path(out_dir) / _model_folder_name(model)
-    idx = _next_catalogue_index(model_dir, db_name)
-    return str(model_dir / f"{db_name}_catalogue_{idx}.json")
+    return str(model_dir / f"{db_name}_catalogue")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -160,8 +146,8 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    out_path = _derive_catalogue_path(connection_string, agent._config.model, out_dir)
-    print(f"Output → {out_path}", file=sys.stderr)
+    out_path = _derive_catalogue_pattern(connection_string, agent._config.model, out_dir)
+    print(f"Output → {Path(out_path).parent}/", file=sys.stderr)
 
     try:
         agent.run(connection_string=connection_string, out_path=out_path)

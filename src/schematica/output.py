@@ -7,6 +7,7 @@ The `console` singleton is the single output channel for the whole application.
 from __future__ import annotations
 
 import json
+import os
 from collections import deque
 from pathlib import Path
 
@@ -213,8 +214,9 @@ def _print_header(connection_string: str, out_path: str, model: str, cache: bool
     console.print(Panel(
         f"[bold]Schematica[/bold]\n"
         f"[dim]Source:[/dim]  {connection_string}\n"
-        f"[dim]Output:[/dim]  {out_path}\n"
-        f"[dim]Model:[/dim]   {model_line}",
+        f"[dim]Output:[/dim]  {Path(out_path).parent}/\n"
+        f"[dim]Model:[/dim]   {model_line}\n"
+        f"[dim]PID:[/dim]     {os.getpid()}",
         border_style="cyan",
         padding=(0, 1),
     ))
@@ -222,7 +224,7 @@ def _print_header(connection_string: str, out_path: str, model: str, cache: bool
 
 def _print_schema_summary(snapshot: dict) -> None:
     t = Text()
-    t.append("Schema snapshot (pre-computed against full DB — row counts, min/max, and null rates are exact):\n", style="bold")
+    t.append("Schema snapshot (pre-computed against full DB — row counts, min/max, null rates, and FK relationships are exact):\n", style="bold")
     for tbl in snapshot["tables"]:
         t.append(f"  {tbl['name']}", style="cyan")
         t.append(f"  ({tbl['row_count']:,} rows, {len(tbl['columns'])} cols)\n", style="dim")
