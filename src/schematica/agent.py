@@ -26,6 +26,7 @@ import json
 import os
 import re
 import time
+import traceback as _traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -60,7 +61,6 @@ from schematica.output import _print_schema_summary
 from schematica.output import _print_summary
 from schematica.output import _render_overview_md
 from schematica.output import _RequestTracker
-from schematica.output import _write_output
 from schematica.output import console
 from schematica.pricing import CACHE_READ_MULTIPLIER
 from schematica.pricing import CACHE_WRITE_MULTIPLIER
@@ -524,6 +524,7 @@ def run(connection_string: str, out_path: str) -> DataCatalogue:
         )
     except Exception as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(f"[dim]{_traceback.format_exc()}[/dim]")
         catalogue_data = None
     elapsed_secs = time.monotonic() - started_at
 
@@ -752,11 +753,19 @@ def _call_with_retry(
 
 
 def _make_backend(
-    initial_user_text: str, system_prompt: str
+    initial_user_text: str, system_prompt: str, client=None
 ) -> "_AnthropicBackend | _LiteLLMBackend":
-    """Create the right backend for the configured provider."""
+    """Create the right backend for the configured provider.
+
+    For the Anthropic path, an optional pre-created *client* can be supplied so
+    that multiple backends (e.g. successive ensemble Phase-1 runs) share a single
+    SDK client object instead of constructing a new one each time.  Each backend
+    still gets its own fresh *messages* list so the conversation histories are
+    independent.
+    """
     if _config.is_anthropic:
-        client = _get_anthropic_client()
+        if client is None:
+            client = _get_anthropic_client()
         if _config.cache:
             messages = [
                 {
@@ -792,6 +801,29 @@ _PHASE2_TARGET_TOKENS = 65_536
 def _phase2_max_tokens() -> int:
     """Phase-2/3 output token budget, capped by the active model's hard limit."""
     return min(_PHASE2_TARGET_TOKENS, _get_max_output_tokens(_config.model))
+
+
+def _dedup_query_logs(query_logs: list[list[dict]]) -> list[list[dict]]:
+    """Remove duplicate SQL queries across ensemble runs.
+
+    When N Phase-1 runs explore the same database they often converge on the
+    same validation queries (e.g. MIN/MAX date range, row counts).  Sending
+    identical SQL blocks to Phase 2 inflates the context without adding
+    information.  We keep the *first* occurrence of each SQL string and drop
+    later duplicates, preserving per-run grouping so the run-section headers
+    in the Phase-2 prompt remain accurate.
+    """
+    seen_sql: set[str] = set()
+    deduped: list[list[dict]] = []
+    for log in query_logs:
+        run_deduped: list[dict] = []
+        for q in log:
+            sql_key = q["sql"].strip()
+            if sql_key not in seen_sql:
+                seen_sql.add(sql_key)
+                run_deduped.append(q)
+        deduped.append(run_deduped)
+    return deduped
 
 
 def _format_ensemble_context(schema_text: str, query_logs: list[list[dict]]) -> str:
@@ -856,6 +888,9 @@ def _agent_loop_ensemble(
     Each Phase-1 run gets its own backend and conversation history.  Their
     validated query logs are combined into a single context for Phase-2 so
     the documentation agent sees the full exploration evidence from all runs.
+
+    All ensemble backends share a single underlying API client object so we
+    avoid repeated SSL/transport initialisation on every run.
     """
     console.print(
         Panel(
@@ -867,7 +902,16 @@ def _agent_loop_ensemble(
         )
     )
 
+    # Create one shared SDK client for ALL backends in this ensemble run.
+    # The Anthropic/LiteLLM clients are stateless HTTP wrappers — only the
+    # messages list (conversation history) differs per run.
+    _shared_client = _get_anthropic_client() if _config.is_anthropic else None
+
     all_query_logs: list[list[dict]] = []
+    # Keep any finish_catalogue payload submitted during Phase 1 as a fallback in
+    # case Phase 2 fails (e.g. safety filter on the combined context).
+    phase1_fallback: dict | None = None
+
     for run_num in range(1, n_ensemble + 1):
         console.print(
             Panel(
@@ -876,8 +920,8 @@ def _agent_loop_ensemble(
                 padding=(0, 1),
             )
         )
-        run_backend = _make_backend(initial_message, SYSTEM_PROMPT)
-        _, _, _, query_log = _run_phase(
+        run_backend = _make_backend(initial_message, SYSTEM_PROMPT, client=_shared_client)
+        catalogue_data, _, _, query_log = _run_phase(
             run_backend,
             engine,
             tools=[_RUN_QUERY_TOOL, _FINISH_CATALOGUE_TOOL],
@@ -892,40 +936,67 @@ def _agent_loop_ensemble(
             required_tables=required_tables,
             min_metrics=min_metrics,
         )
+        if catalogue_data is not None:
+            phase1_fallback = catalogue_data  # most recent valid Phase-1 result
         all_query_logs.append(query_log)
         console.print(
             f"[dim]  Exploration {run_num}/{n_ensemble} complete — "
             f"{len(query_log)} queries validated[/dim]\n"
         )
 
+    total_q = sum(len(l) for l in all_query_logs)
+    # Deduplicate queries by SQL so runs that explored the same query don't
+    # bloat the Phase-2 context with identical entries.
+    deduped_logs = _dedup_query_logs(all_query_logs)
+    deduped_q = sum(len(l) for l in deduped_logs)
+    dedup_note = (
+        f" ({total_q - deduped_q} duplicate SQL queries removed)" if deduped_q < total_q else ""
+    )
     console.print(
         Panel(
             f"[bold cyan]All {n_ensemble} explorations complete — entering Phase 2 (documentation)[/bold cyan]\n"
-            f"[dim]{sum(len(l) for l in all_query_logs)} total validated queries across {n_ensemble} runs. "
+            f"[dim]{deduped_q} unique validated queries across {n_ensemble} runs{dedup_note}. "
             "Compiling combined catalogue.[/dim]",
             border_style="cyan",
             padding=(0, 1),
         )
     )
 
-    ensemble_context = _format_ensemble_context(schema_text, all_query_logs)
-    phase2_backend = _make_backend(ensemble_context, SYSTEM_PROMPT)
+    ensemble_context = _format_ensemble_context(schema_text, deduped_logs)
+    phase2_backend = _make_backend(ensemble_context, SYSTEM_PROMPT, client=_shared_client)
 
-    catalogue_data, _, _, _ = _run_phase(
-        phase2_backend,
-        engine,
-        tools=[_FINISH_CATALOGUE_TOOL],
-        max_iter=5,
-        phase_label="2 (ensemble documentation)",
-        usage=usage,
-        table_columns=table_columns,
-        required_tables=required_tables,
-        min_metrics=min_metrics,
-        tracker=tracker,
-        initial_max_tokens=_phase2_max_tokens(),
-    )
+    try:
+        catalogue_data, _, _, _ = _run_phase(
+            phase2_backend,
+            engine,
+            tools=[_FINISH_CATALOGUE_TOOL],
+            max_iter=5,
+            phase_label="2 (ensemble documentation)",
+            usage=usage,
+            table_columns=table_columns,
+            required_tables=required_tables,
+            min_metrics=min_metrics,
+            tracker=tracker,
+            initial_max_tokens=_phase2_max_tokens(),
+        )
+    except RuntimeError as exc:
+        if phase1_fallback is not None:
+            console.print(
+                f"[yellow]  Phase 2 failed ({exc}). "
+                "Falling back to best Phase-1 catalogue.[/yellow]"
+            )
+            return phase1_fallback
+        raise
+
     if catalogue_data is not None:
         return catalogue_data
+
+    if phase1_fallback is not None:
+        console.print(
+            "[yellow]  Phase 2 produced no catalogue. "
+            "Falling back to best Phase-1 catalogue.[/yellow]"
+        )
+        return phase1_fallback
 
     raise RuntimeError(
         f"Ensemble agent did not produce a catalogue after {n_ensemble} explorations."
@@ -955,10 +1026,6 @@ def _agent_loop(
         f"validate the metrics you plan to include in the catalogue."
     )
 
-    # Both Phase 1 and Phase 2 share the same backend — the message history
-    # from Phase 1 carries forward into Phase 2.
-    backend = _make_backend(initial_message, SYSTEM_PROMPT)
-
     n_ensemble = int(_optional_env("SC_ENSEMBLE_RUNS", "1"))
 
     if n_ensemble > 1:
@@ -980,7 +1047,8 @@ def _agent_loop(
         )
 
     # ── Single-run path (n_ensemble == 1) — original behaviour ─────────────────
-    # Phase 1 — exploration with both tools available.
+    # Phase 1 and Phase 2 share the same backend — conversation history carries forward.
+    backend = _make_backend(initial_message, SYSTEM_PROMPT)
     catalogue_data, last_rejection_reasons, _, _ = _run_phase(
         backend,
         engine,

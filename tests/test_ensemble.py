@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from schematica.agent import _dedup_query_logs
 from schematica.agent import _format_ensemble_context
 
 
@@ -153,3 +154,52 @@ def test_total_query_count_in_header():
 
     # QUERY_LOG_A has 2, QUERY_LOG_B has 1 → 3 total
     assert "3" in result
+
+
+# ── _dedup_query_logs ─────────────────────────────────────────────────────────
+
+def test_dedup_removes_identical_sql_across_runs():
+    # Same SQL appears in both run A and run B — only the first occurrence kept.
+    shared = {"sql": "SELECT COUNT(*) FROM orders", "reason": "r", "plain_language": "pl", "result": "1"}
+    log_a = [shared]
+    log_b = [shared]
+
+    result = _dedup_query_logs([log_a, log_b])
+
+    assert sum(len(l) for l in result) == 1
+
+
+def test_dedup_keeps_unique_sql_from_both_runs():
+    q1 = {"sql": "SELECT COUNT(*) FROM orders", "reason": "r", "plain_language": "pl", "result": "1"}
+    q2 = {"sql": "SELECT MAX(created_at) FROM orders", "reason": "r", "plain_language": "pl", "result": "x"}
+    log_a = [q1]
+    log_b = [q2]
+
+    result = _dedup_query_logs([log_a, log_b])
+
+    assert sum(len(l) for l in result) == 2
+
+
+def test_dedup_preserves_run_grouping_structure():
+    q1 = {"sql": "SELECT 1", "reason": "r", "plain_language": "pl", "result": "1"}
+    q2 = {"sql": "SELECT 2", "reason": "r", "plain_language": "pl", "result": "2"}
+
+    result = _dedup_query_logs([[q1], [q2]])
+
+    assert len(result) == 2  # two runs preserved
+
+
+def test_dedup_empty_logs_returns_empty_structure():
+    result = _dedup_query_logs([[], []])
+
+    assert result == [[], []]
+
+
+def test_dedup_ignores_leading_trailing_whitespace_in_sql():
+    q1 = {"sql": "SELECT 1", "reason": "r", "plain_language": "pl", "result": "1"}
+    q2 = {"sql": "  SELECT 1  ", "reason": "r", "plain_language": "pl", "result": "1"}
+
+    result = _dedup_query_logs([[q1], [q2]])
+
+    # Both SQL strings normalise to "SELECT 1" → second is a duplicate
+    assert sum(len(l) for l in result) == 1
