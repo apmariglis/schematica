@@ -108,8 +108,12 @@ General rules:
   single-scalar queries in measurable_metrics.
 - Where a count metric is meaningful, consider whether the rate or percentage \
   form (count ÷ relevant base) is also worth including as a separate metric.
-- When breaking a metric down by a categorical column, cover ALL distinct values \
-  shown in top_values in the snapshot — do not silently omit any.
+- DIMENSIONAL COMPLETENESS IS MANDATORY. When you decide to break a metric down \
+  by any categorical column you MUST first run SELECT DISTINCT <col> FROM <table> \
+  to discover every value in the live data, then produce one metric per value — \
+  no partial enumerations. The top_values in the snapshot may be truncated; always \
+  verify with a live query before committing to the breakdown. If you create one \
+  dimensional variant you must create all of them in the same run.
 - When SQL filters on a coded value, explain all codes used in agent_notes \
   so consumers understand what is and is not included.
 - Every table must appear in at least one metric OR one queryable fact. A table \

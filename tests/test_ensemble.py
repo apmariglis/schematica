@@ -93,8 +93,9 @@ def test_run_count_label_for_multiple_runs():
 def test_run_section_headers_present_for_two_runs():
     result = _format_ensemble_context(SCHEMA, [QUERY_LOG_A, QUERY_LOG_B])
 
-    assert "EXPLORATION RUN 1 / 2" in result
-    assert "EXPLORATION RUN 2 / 2" in result
+    # New format: "— Run 1 / 2  (N queries) —"
+    assert "Run 1 / 2" in result
+    assert "Run 2 / 2" in result
 
 
 def test_query_count_per_run_shown():
@@ -154,6 +155,68 @@ def test_total_query_count_in_header():
 
     # QUERY_LOG_A has 2, QUERY_LOG_B has 1 → 3 total
     assert "3" in result
+
+
+# ── phase1_catalogues proposals ───────────────────────────────────────────────
+
+# A minimal valid catalogue proposal (subset of fields used by _format_ensemble_context)
+CATALOGUE_PROPOSAL = {
+    "measurable_metrics": [
+        {"name": "New Orders", "sql": "SELECT date, COUNT(*) FROM orders GROUP BY date"},
+        {"name": "Average Order Value", "sql": "SELECT date, AVG(amount) FROM orders GROUP BY date"},
+    ],
+    "queryable_facts": [
+        {"name": "Total Order Count"},
+    ],
+}
+
+
+def test_no_proposals_section_when_catalogues_not_provided():
+    result = _format_ensemble_context(SCHEMA, [QUERY_LOG_A])
+
+    assert "PHASE-1 CATALOGUE PROPOSALS" not in result
+
+
+def test_no_proposals_section_when_all_catalogues_are_none():
+    result = _format_ensemble_context(SCHEMA, [QUERY_LOG_A], phase1_catalogues=[None])
+
+    assert "PHASE-1 CATALOGUE PROPOSALS" not in result
+
+
+def test_proposals_section_present_when_catalogue_provided():
+    result = _format_ensemble_context(SCHEMA, [QUERY_LOG_A], phase1_catalogues=[CATALOGUE_PROPOSAL])
+
+    assert "PHASE-1 CATALOGUE PROPOSALS" in result
+
+
+def test_metric_names_listed_in_proposals_section():
+    result = _format_ensemble_context(SCHEMA, [QUERY_LOG_A], phase1_catalogues=[CATALOGUE_PROPOSAL])
+
+    assert "New Orders" in result
+    assert "Average Order Value" in result
+
+
+def test_fact_names_listed_in_proposals_section():
+    result = _format_ensemble_context(SCHEMA, [QUERY_LOG_A], phase1_catalogues=[CATALOGUE_PROPOSAL])
+
+    assert "Total Order Count" in result
+
+
+def test_proposal_count_reflects_only_non_none_entries():
+    # 2 runs, but only 1 submitted a catalogue (the other is None)
+    result = _format_ensemble_context(
+        SCHEMA,
+        [QUERY_LOG_A, QUERY_LOG_B],
+        phase1_catalogues=[CATALOGUE_PROPOSAL, None],
+    )
+
+    assert "1 of 2" in result
+
+
+def test_union_instruction_present_when_proposals_included():
+    result = _format_ensemble_context(SCHEMA, [QUERY_LOG_A], phase1_catalogues=[CATALOGUE_PROPOSAL])
+
+    assert "UNION" in result.upper()
 
 
 # ── _dedup_query_logs ─────────────────────────────────────────────────────────

@@ -217,6 +217,7 @@ class _LiteLLMBackend:
             messages=[{"role": "system", "content": self._system}] + self.messages,
             tools=openai_tools,
             max_tokens=max_tokens,
+            timeout=300,  # 5-minute hard cap; retried by _call_with_retry on timeout
         )
         if not response.choices:
             global _empty_response_count

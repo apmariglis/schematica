@@ -738,13 +738,15 @@ def _call_with_retry(
                 or "rate_limited" in msg
             )
             is_transient = "overloaded" in msg or "503" in msg or "502" in msg
-            if not (is_rate_limit or is_transient) or attempt == max_attempts:
+            is_timeout = "timeout" in msg or "timed out" in msg
+            if not (is_rate_limit or is_transient or is_timeout) or attempt == max_attempts:
                 raise
             hint = _retry_after_seconds(exc)
             wait = hint if hint is not None else delay
             source = "API hint" if hint is not None else "own backoff"
+            reason = "Rate limit" if is_rate_limit else "Timeout" if is_timeout else "Transient error"
             console.print(
-                f"[yellow]  Rate limit hit — waiting {wait:.0f}s before retry "
+                f"[yellow]  {reason} — waiting {wait:.0f}s before retry "
                 f"(attempt {attempt}/{max_attempts - 1}, {source})[/yellow]"
             )
             time.sleep(wait)
@@ -826,28 +828,68 @@ def _dedup_query_logs(query_logs: list[list[dict]]) -> list[list[dict]]:
     return deduped
 
 
-def _format_ensemble_context(schema_text: str, query_logs: list[list[dict]]) -> str:
-    """Format N Phase-1 query logs into a single Phase-2 initial message.
+def _format_ensemble_context(
+    schema_text: str,
+    query_logs: list[list[dict]],
+    phase1_catalogues: list[dict] | None = None,
+) -> str:
+    """Format N Phase-1 query logs (and optional catalogue proposals) into a single
+    Phase-2 initial message.
 
     Each entry in query_logs is the query_log returned by one Phase-1 _run_phase
     call: a list of dicts with keys sql, reason, plain_language, result.
 
-    The returned string provides the schema snapshot and every validated
-    query + result so the Phase-2 agent has the full exploration evidence.
+    phase1_catalogues is a list of finish_catalogue payloads submitted by Phase-1
+    runs (may contain None entries for runs that did not submit one).  When present
+    they are shown to Phase-2 as «draft proposals» so it can union the metric lists
+    from all runs rather than deriving everything from scratch.
     """
     n = len(query_logs)
     total_queries = sum(len(log) for log in query_logs)
+    valid_catalogues = [c for c in (phase1_catalogues or []) if c is not None]
+
     parts: list[str] = [
         f"Here is the complete schema snapshot of the database:\n\n"
         f"```\n{schema_text}\n```\n\n"
         f"PHASE 1 was run {n} time{'s' if n != 1 else ''} independently on this database. "
         f"Each run explored the schema and validated SQL against the live data. "
-        f"All {total_queries} validated queries and their results are provided below.\n"
-        f"Use this combined evidence to produce the most comprehensive and accurate catalogue possible.\n",
+        f"All {total_queries} unique validated queries and their results are provided below.\n",
     ]
+
+    if valid_catalogues:
+        bar = "═" * 60
+        parts.append(
+            f"\n{bar}\n"
+            f"PHASE-1 CATALOGUE PROPOSALS ({len(valid_catalogues)} of {n} runs submitted one)\n"
+            f"{bar}\n"
+            "These are draft catalogues produced by Phase-1 runs before they had finished "
+            "exploring. Treat them as a collective starting point — union their metric lists "
+            "and prefer more specific validated SQL over vaguer alternatives. Do NOT discard "
+            "a metric that appears in any proposal unless you have evidence it is incorrect.\n"
+        )
+        for run_idx, cat in enumerate(valid_catalogues, 1):
+            metrics = cat.get("measurable_metrics") or []
+            facts = cat.get("queryable_facts") or []
+            parts.append(
+                f"\n--- Proposal {run_idx}: "
+                f"{len(metrics)} metrics, {len(facts)} facts ---\n"
+            )
+            for m in metrics:
+                name = m.get("name", "?")
+                sql = m.get("sql", "").strip().replace("\n", " ")
+                if len(sql) > 120:
+                    sql = sql[:120] + "…"
+                parts.append(f"  METRIC: {name}  |  SQL: {sql}\n")
+            for f in facts:
+                name = f.get("name", "?")
+                parts.append(f"  FACT:   {name}\n")
+
     bar = "═" * 60
+    parts.append(f"\n{bar}\nVALIDATED QUERY EVIDENCE ({total_queries} unique queries)\n{bar}\n")
     for run_idx, log in enumerate(query_logs, 1):
-        parts.append(f"\n{bar}\nEXPLORATION RUN {run_idx} / {n}  ({len(log)} queries)\n{bar}\n")
+        if not log:
+            continue
+        parts.append(f"\n— Run {run_idx} / {n}  ({len(log)} queries) —\n")
         for q_idx, q in enumerate(log, 1):
             label = q.get("plain_language") or q.get("reason") or f"Query {q_idx}"
             result = q["result"]
@@ -858,11 +900,16 @@ def _format_ensemble_context(schema_text: str, query_logs: list[list[dict]]) -> 
                 f"SQL: {q['sql']}\n"
                 f"Result:\n{result}\n"
             )
+
     parts.append(
         f"\n{bar}\n"
         "You are in PHASE 2 — DOCUMENTATION. The run_query tool is not available.\n"
-        "Call finish_catalogue now. Draw on all exploration runs above — include every\n"
-        "metric that was validated by at least one run, and every table that was queried."
+        "Call finish_catalogue now. Your goal is the UNION of all Phase-1 proposals:\n"
+        "- Include every metric that was validated by at least one run.\n"
+        "- For each concept, use the most precise SQL from any run.\n"
+        "- Do not drop metrics just because they appeared in only one proposal.\n"
+        "- Apply DIMENSIONAL COMPLETENESS: if any run enumerated dimension variants,\n"
+        "  include ALL of them (add any missing variants you can infer from the queries)."
     )
     return "".join(parts)
 
@@ -908,8 +955,10 @@ def _agent_loop_ensemble(
     _shared_client = _get_anthropic_client() if _config.is_anthropic else None
 
     all_query_logs: list[list[dict]] = []
-    # Keep any finish_catalogue payload submitted during Phase 1 as a fallback in
-    # case Phase 2 fails (e.g. safety filter on the combined context).
+    # Collect every finish_catalogue payload from Phase-1 runs:
+    # - phase1_catalogues: all proposals, for enriching Phase-2 context
+    # - phase1_fallback: most recent valid one, used if Phase-2 itself fails
+    phase1_catalogues: list[dict | None] = []
     phase1_fallback: dict | None = None
 
     for run_num in range(1, n_ensemble + 1):
@@ -936,12 +985,14 @@ def _agent_loop_ensemble(
             required_tables=required_tables,
             min_metrics=min_metrics,
         )
+        phase1_catalogues.append(catalogue_data)
         if catalogue_data is not None:
-            phase1_fallback = catalogue_data  # most recent valid Phase-1 result
+            phase1_fallback = catalogue_data
         all_query_logs.append(query_log)
+        submitted = "catalogue submitted" if catalogue_data is not None else "no catalogue submitted"
         console.print(
             f"[dim]  Exploration {run_num}/{n_ensemble} complete — "
-            f"{len(query_log)} queries validated[/dim]\n"
+            f"{len(query_log)} queries validated, {submitted}[/dim]\n"
         )
 
     total_q = sum(len(l) for l in all_query_logs)
@@ -949,6 +1000,7 @@ def _agent_loop_ensemble(
     # bloat the Phase-2 context with identical entries.
     deduped_logs = _dedup_query_logs(all_query_logs)
     deduped_q = sum(len(l) for l in deduped_logs)
+    n_proposals = sum(1 for c in phase1_catalogues if c is not None)
     dedup_note = (
         f" ({total_q - deduped_q} duplicate SQL queries removed)" if deduped_q < total_q else ""
     )
@@ -956,13 +1008,14 @@ def _agent_loop_ensemble(
         Panel(
             f"[bold cyan]All {n_ensemble} explorations complete — entering Phase 2 (documentation)[/bold cyan]\n"
             f"[dim]{deduped_q} unique validated queries across {n_ensemble} runs{dedup_note}. "
+            f"{n_proposals}/{n_ensemble} Phase-1 runs submitted a catalogue proposal. "
             "Compiling combined catalogue.[/dim]",
             border_style="cyan",
             padding=(0, 1),
         )
     )
 
-    ensemble_context = _format_ensemble_context(schema_text, deduped_logs)
+    ensemble_context = _format_ensemble_context(schema_text, deduped_logs, phase1_catalogues)
     phase2_backend = _make_backend(ensemble_context, SYSTEM_PROMPT, client=_shared_client)
 
     try:
