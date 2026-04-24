@@ -741,6 +741,10 @@ def _call_with_retry(
             is_timeout = "timeout" in msg or "timed out" in msg
             if not (is_rate_limit or is_transient or is_timeout) or attempt == max_attempts:
                 raise
+            # Timeouts are usually caused by large context; cap at 2 attempts (1 retry)
+            # rather than burning through all 7 and waiting 35+ minutes before fallback.
+            if is_timeout and attempt >= 2:
+                raise
             hint = _retry_after_seconds(exc)
             wait = hint if hint is not None else delay
             source = "API hint" if hint is not None else "own backoff"
@@ -1032,7 +1036,7 @@ def _agent_loop_ensemble(
             tracker=tracker,
             initial_max_tokens=_phase2_max_tokens(),
         )
-    except RuntimeError as exc:
+    except Exception as exc:
         if phase1_fallback is not None:
             console.print(
                 f"[yellow]  Phase 2 failed ({exc}). "

@@ -163,3 +163,40 @@ def test_empty_choices_does_not_append_user_nudge():
         _call_with_retry(backend, [])
 
     assert len(backend.nudge_messages) == 0
+
+
+# ── timeouts — retried at most once (2 total attempts) ────────────────────────
+# Timeouts are usually caused by large context that won't resolve on retry;
+# capping at 2 attempts prevents a 35-minute wait before the Phase-1 fallback.
+
+_TIMEOUT_MSG = "Connection timed out after 300 seconds"
+
+
+def test_timeout_error_stops_after_two_attempts():
+    # Timeout retries are capped at 2 total calls — 1 initial + 1 retry.
+    backend = _CountingBackend(Exception(_TIMEOUT_MSG))
+
+    with patch("time.sleep"), patch("schematica.agent.console"):
+        with pytest.raises(Exception):
+            _call_with_retry(backend, [], max_attempts=7)
+
+    assert backend.call_count == 2
+
+
+def test_timeout_error_reraises_the_original_exception():
+    backend = _CountingBackend(Exception(_TIMEOUT_MSG))
+
+    with patch("time.sleep"), patch("schematica.agent.console"):
+        with pytest.raises(Exception, match="timed out"):
+            _call_with_retry(backend, [], max_attempts=7)
+
+
+def test_timeout_error_sleeps_once_before_the_single_retry():
+    # Exactly one sleep between the two attempts.
+    backend = _CountingBackend(Exception(_TIMEOUT_MSG))
+
+    with patch("time.sleep") as mock_sleep, patch("schematica.agent.console"):
+        with pytest.raises(Exception):
+            _call_with_retry(backend, [], max_attempts=7)
+
+    assert mock_sleep.call_count == 1
