@@ -23,7 +23,7 @@ from schematica.db import make_readonly_engine
 
 
 # Column name fragments that suggest a date/time value even when stored as TEXT
-_DATE_NAME_HINTS = ("_dt", "dt_", "date", "time", "period", "month", "year")
+_DATE_NAME_HINTS = ("_dt", "dt_", "_at", "_ts", "date", "time", "period", "month", "year")
 
 # SQL type fragments that indicate numeric values
 _NUMERIC_TYPE_HINTS = ("INT", "REAL", "FLOAT", "NUMERIC", "DECIMAL", "DOUBLE", "MONEY", "NUMBER")
@@ -77,6 +77,16 @@ def introspect(connection_string: str) -> dict:
     }
 
 
+# Columns with more distinct values than this are too high-cardinality to be
+# useful as metric breakdown dimensions (e.g. hundreds of free-text categories).
+_DIMENSION_CARDINALITY_LIMIT = 20
+
+# Reference/lookup tables are distinguished from fact tables by row count.
+# A table with more rows than this is treated as a fact table whose FK
+# column is not a useful dimension (e.g. account_id → accounts).
+_MAX_LOOKUP_TABLE_ROWS = 200
+
+
 def render_as_text(snapshot: dict) -> str:
     """Compact human-readable rendering used as context in the agent's initial message."""
     lines = [
@@ -84,6 +94,9 @@ def render_as_text(snapshot: dict) -> str:
         f"DIALECT:  {snapshot['dialect']}",
         "",
     ]
+    manifest = _build_dimension_manifest(snapshot)
+    if manifest:
+        lines.append(manifest)
     for t in snapshot["tables"]:
         lines.append(f"TABLE: {t['name']}  ({t['row_count']:,} rows)")
         for c in t["columns"]:
@@ -107,6 +120,80 @@ def render_as_text(snapshot: dict) -> str:
             lines.append(f"  SAMPLE ROW: {json.dumps(t['sample_rows'][0], default=str)}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _build_dimension_manifest(snapshot: dict) -> str:
+    """Return a section listing every low-cardinality categorical column and its values.
+
+    Included:
+      - Text columns with n_distinct in [2, _DIMENSION_CARDINALITY_LIMIT]
+      - FK columns whose target is a small lookup table with a text label column
+
+    Excluded:
+      - Primary keys (identifiers, not breakdown dimensions)
+      - Numeric / date columns (they carry min/max stats, not top_values)
+      - Unary columns (n_distinct == 1 — no breakdown is possible)
+      - Columns above the cardinality limit
+      - FK columns pointing to large fact tables
+
+    The result is injected into the schema text passed to every LLM phase so the
+    model always sees the complete set of dimension values without having to
+    discover them through exploratory queries.
+    """
+    tables_by_name = {t["name"]: t for t in snapshot["tables"]}
+
+    # (table_name, col_name) → target_table_name
+    fk_targets: dict[tuple[str, str], str] = {}
+    for t in snapshot["tables"]:
+        for fk in t.get("foreign_keys", []):
+            for from_col in fk["from_cols"]:
+                fk_targets[(t["name"], from_col)] = fk["to_table"]
+
+    def _label_values(table_name: str) -> list[str] | None:
+        """Return sorted distinct values of the first suitable label column, or None."""
+        t = tables_by_name.get(table_name)
+        if not t or t.get("row_count", 0) > _MAX_LOOKUP_TABLE_ROWS:
+            return None
+        for col in t["columns"]:
+            if col["primary_key"]:
+                continue
+            stats = col["stats"]
+            n = stats.get("n_distinct", 0)
+            if "top_values" in stats and 2 <= n <= _DIMENSION_CARDINALITY_LIMIT:
+                return sorted(stats["top_values"].keys())
+        return None
+
+    lines = []
+    for t in snapshot["tables"]:
+        table_name = t["name"]
+        for col in t["columns"]:
+            if col["primary_key"]:
+                continue
+            col_name = col["name"]
+            stats    = col["stats"]
+
+            if "top_values" in stats:
+                n = stats.get("n_distinct", 0)
+                if 2 <= n <= _DIMENSION_CARDINALITY_LIMIT:
+                    values = sorted(stats["top_values"].keys())
+                    # Skip columns whose values look like JSON — they are structured
+                    # payloads stored in text columns, not categorical dimensions.
+                    if any(v.startswith("{") or v.startswith("[") for v in values):
+                        continue
+                    lines.append(f"  {table_name}.{col_name}  →  {', '.join(values)}")
+
+            elif (table_name, col_name) in fk_targets:
+                target = fk_targets[(table_name, col_name)]
+                label_values = _label_values(target)
+                if label_values:
+                    lines.append(
+                        f"  {table_name}.{col_name} (via {target})  →  {', '.join(label_values)}"
+                    )
+
+    if not lines:
+        return ""
+
+    return "DIMENSION BREAKDOWNS AVAILABLE\n" + "\n".join(lines) + "\n"
 
 
 # ── private ────────────────────────────────────────────────────────────────────

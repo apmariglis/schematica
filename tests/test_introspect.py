@@ -251,3 +251,15 @@ def test_render_as_text_shows_all_columns_of_composite_foreign_key(composite_fk_
 
     assert "event_id" in output
     assert "attendee_id" in output
+
+
+def test_column_with_at_suffix_gets_min_max_stats_not_top_values(populated_db):
+    # Columns named *_at are timestamps stored as TEXT in SQLite; they should
+    # be treated as date columns (min/max range) rather than categoricals.
+    snapshot = introspect(populated_db)
+
+    events = next(t for t in snapshot["tables"] if t["name"] == "events")
+    occurred_at = next(c for c in events["columns"] if c["name"] == "occurred_at")
+
+    assert "min" in occurred_at["stats"]
+    assert "top_values" not in occurred_at["stats"]
